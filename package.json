@@ -1,0 +1,7 @@
+{
+  "name": "opencode-prefer-free",
+  "version": "1.2.0",
+  "description": "OpenCode plugin that swaps paid opencode-go models for free equivalents (NVIDIA NIM + OpenRouter :free + OpenCode Zen), with mid-session failover when a free model rate-limits or hangs",
+  "license": "MIT",
+  "keywords": ["opencode", "plugin", "free", "models", "nvidia-nim", "openrouter"]
+}
