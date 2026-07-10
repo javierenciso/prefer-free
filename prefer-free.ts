@@ -321,14 +321,33 @@ async function refreshRuntimeModels(client: any, shell?: any): Promise<Set<strin
   // 2) Fallback: `opencode models` por shell. En algunas versiones/entornos
   // el endpoint SDK devuelve vacío aunque el CLI lista todo — el CLI es la
   // fuente de verdad de lo que realmente está registrado en runtime.
-  if (!out.size && shell) {
+  //
+  // CRÍTICO: `opencode models` bootea otra instancia de OpenCode que vuelve a
+  // cargar este plugin y correr su hook `config`. Si el fallback se dispara ahí,
+  // hay recursión infinita (TUI en negro). Por eso:
+  //   - el hook `config` NUNCA pasa shell (SDK-only en el arranque)
+  //   - marcamos un env guard para que el hijo no re-spawnee jamás
+  if (!out.size && shell && !process.env.PREFER_FREE_NO_RUNTIME_SHELL) {
     try {
-      const txt: string = await shell`opencode models`.nothrow().quiet().text()
+      const txt: string = await shell`opencode models`
+        .env({ ...process.env, PREFER_FREE_NO_RUNTIME_SHELL: "1" })
+        .nothrow()
+        .quiet()
+        .text()
       for (const line of (txt || "").split("\n")) {
         const t = line.trim()
         if (t && t.includes("/") && !t.includes(" ")) out.add(t)
       }
-    } catch {}
+    } catch {
+      // BunShell puede no soportar .env(...) en toda versión — reintento simple.
+      try {
+        const txt: string = await shell`opencode models`.nothrow().quiet().text()
+        for (const line of (txt || "").split("\n")) {
+          const t = line.trim()
+          if (t && t.includes("/") && !t.includes(" ")) out.add(t)
+        }
+      } catch {}
+    }
   }
   return out
 }
@@ -1445,7 +1464,10 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         refreshCatalog().catch(() => {})
       }
 
-      const runtime = await refreshRuntimeModels(client, $)
+      // SDK-only en el arranque: NUNCA pasar shell acá. `opencode models`
+      // bootearía otra instancia que recarga este hook → recursión infinita
+      // (TUI en negro). El fallback por shell queda solo en /code-review-free.
+      const runtime = await refreshRuntimeModels(client)
       if (runtime.size) cachedRuntimeModels = runtime
 
       // Union of free model ids, intersected with OpenCode's runtime registry
