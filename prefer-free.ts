@@ -235,11 +235,12 @@ const OPENROUTER_EQUIVALENTS: Record<string, string[]> = {
 // Treat these as ordered preferences — always intersect with the runtime
 // registry before prompting (see refreshRuntimeModels / computeAllFree).
 const ZEN_FREE = new Set([
-  "opencode/deepseek-v4-flash-free",
-  "opencode/mimo-v2.5-free",
-  "opencode/nemotron-3-super-free",
-  "opencode/glm-5-free",
   "opencode/big-pickle",
+  "opencode/deepseek-v4-flash-free",
+  "opencode/hy3-free",
+  "opencode/mimo-v2.5-free",
+  "opencode/nemotron-3-ultra-free",
+  "opencode/north-mini-code-free",
 ])
 
 // ── Free detection ─────────────────────────────────────────────
@@ -421,22 +422,23 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 // review. Por defecto lo muestra en la TUI; con --post lo sube como comentario
 // al PR usando gh.
 //
-// Cómo elige los 3 modelos: parte de PREFERRED_REVIEW_MODELS (lo mejor de los
-// free — GLM-5.2, Kimi K2.6, DeepSeek V4-Pro) y va bajando a los "buenos para
-// código" si alguno no está disponible. Nunca usa paid.
+// Cómo elige los 3 modelos: solo opencode/* de 2 segmentos en sub-sessions.
+// NIM de 3 segmentos (nvidia/org/model) falla en session.promptAsync porque
+// OpenCode parte el id en el primer "/" — y muchos ids del catálogo NIM no
+// están registrados en runtime aunque models.dev / .prefer-free-catalog los liste.
 const PREFERRED_REVIEW_MODELS: string[] = [
-  "nvidia/z-ai/glm-5.2",
-  "nvidia/moonshotai/kimi-k2.6",
-  "nvidia/deepseek-ai/deepseek-v4-pro",
+  "opencode/hy3-free",
+  "opencode/deepseek-v4-flash-free",
+  "opencode/mimo-v2.5-free",
 ]
 
 const OTHER_REVIEW_FREE: string[] = [
-  "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
-  "nvidia/qwen/qwen3.5-397b-a17b",
+  "opencode/nemotron-3-ultra-free",
+  "opencode/north-mini-code-free",
+  "opencode/big-pickle",
+  "nvidia/z-ai/glm-5.2",
   "nvidia/deepseek-ai/deepseek-v4-flash",
-  "opencode/glm-5-free",
-  "opencode/deepseek-v4-flash-free",
-  "opencode/mimo-v2.5-free",
+  "nvidia/deepseek-ai/deepseek-v4-pro",
   "nvidia/meta/llama-3.3-70b-instruct",
 ]
 
@@ -474,6 +476,32 @@ function setCommandParts(output: { parts: any[] }, ...parts: any[]) {
 function splitModel(ref: string): { providerID: string; modelID: string } {
   const slash = ref.indexOf("/")
   return { providerID: ref.slice(0, slash), modelID: ref.slice(slash + 1) }
+}
+
+// Sub-sessions de /code-review-free: solo modelos registrados en runtime.
+// Si refreshRuntimeModels falla (runtime vacío), no confiar en ids del catálogo
+// NIM/Zen hardcodeados — caer solo a ZEN_FREE conservador.
+function pickReviewModels(
+  runtime: Set<string>,
+  cachedFree: Set<string>,
+  count = 3,
+): string[] {
+  const inRuntime = (m: string) => runtime.size > 0 && runtime.has(m)
+  const candidates = [
+    ...PREFERRED_REVIEW_MODELS,
+    ...OTHER_REVIEW_FREE,
+    ...(cachedFree.size ? [...cachedFree] : []),
+    ...ZEN_FREE,
+  ]
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const m of candidates) {
+    if (seen.has(m) || out.length >= count) continue
+    seen.add(m)
+    if (!inRuntime(m)) continue
+    out.push(m)
+  }
+  return out
 }
 
 // Parsea "URL o número" y devuelve { repo: "owner/repo" | null, pr: number }
@@ -988,45 +1016,25 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           truncatedNote = `\n\n>[diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales)]\n\n`
         }
 
-        // ── Etapa 2: pick 3 models (runtime-validated) ──
-        const runtime = cachedRuntimeModels.size
+        // ── Etapa 2: pick 3 models (runtime-validated, strict) ──
+        let runtime = cachedRuntimeModels.size
           ? cachedRuntimeModels
           : await refreshRuntimeModels(cli)
+        if (!runtime.size) runtime = await refreshRuntimeModels(cli)
         if (runtime.size) cachedRuntimeModels = runtime
 
-        const isUsable = (m: string, set: Set<string>) =>
-          set.has(m) && (!runtime.size || runtime.has(m))
-
-        const pick = (set: Set<string>, count: number): string[] => {
-          const out: string[] = []
-          for (const m of PREFERRED_REVIEW_MODELS) if (isUsable(m, set) && out.length < count) out.push(m)
-          for (const m of OTHER_REVIEW_FREE) if (isUsable(m, set) && out.length < count) out.push(m)
-          return out
-        }
-        // Always include hardcoded prefs (works even if prefer-free swap is OFF /
-        // cachedAllFree empty). isUsable() still requires runtime registration.
-        const allFree = new Set<string>([
-          ...PREFERRED_REVIEW_MODELS,
-          ...OTHER_REVIEW_FREE,
-          ...ZEN_FREE,
-          ...(cachedAllFree.size ? [...cachedAllFree] : []),
-        ])
-        let models = pick(allFree, 3)
-        if (models.length < 3) {
-          for (const m of [...ZEN_FREE]) {
-            if (!models.includes(m) && (!runtime.size || runtime.has(m)) && models.length < 3) {
-              models.push(m)
-            }
-          }
-        }
+        let models = pickReviewModels(runtime, cachedAllFree, 3)
         if (models.length === 0) {
+          const hint = runtime.size
+            ? "Ningún modelo free del catálogo está registrado en OpenCode."
+            : "No pude leer el registro de modelos de OpenCode (runtime vacío)."
           await cli.tui.showToast({ body: {
             title: "code-review-free",
-            message: "❌ No hay modelos free disponibles.",
+            message: `❌ ${hint}`,
             variant: "error",
             duration: 8000,
           } }).catch(() => {})
-          await publishToSession(cli, sessionID, tp("❌ No encontré ningún modelo free para hacer code review."))
+          await publishToSession(cli, sessionID, tp(`❌ No encontré modelos free para code review. ${hint}`))
           return
         }
 
