@@ -656,6 +656,54 @@ function editDistanceRatio(a: string, b: string): number {
   return 1 - common / union
 }
 
+// Construye el prompt base de code review en español, con el diff recortado y
+// metadatos del PR. Es lo que se le manda a cada modelo reviewer en la ronda 1.
+function buildReviewPrompt(
+  pr: { title: string; body: string; head: string },
+  diff: string,
+  truncatedNote: string,
+): string {
+  return [
+    `Estás revisando un Pull Request. Basate en el diff y los metadatos.`,
+    "Reglas:",
+    "- Sé concreto y corto.",
+    "- Para cada issue: `### severidad\nArchivos: paths:lines\nProblema:\n  …\nSugerencia:\n  …`",
+    "- Si no hay nada crítico, decí 1 palabra en la 1era línea; no inventes.",
+    "- No propongas cambios que no estén relacionados al diff. Sé estricto.",
+    "- Si usás tools, leé nada más que los archivos del diff para ficharse del contexto.",
+    "",
+    `PR: ${pr.title}${pr.head ? ` (head: ${pr.head})` : ""}`,
+    "Descripción:",
+    (pr.body || "(sin descripción)").slice(0, 4000),
+    "",
+    "Diff:",
+    "```diff",
+    diff,
+    "```",
+    truncatedNote,
+  ].join("\n")
+}
+
+// Publica texto en la sesión como un mensaje visible SIN trigger el LLM.
+// Usa noReply:true (ver issue anomalyco/opencode#9306 y recipe en
+// github.com/malhashemi/opencode-skills). Si noReply no está soportado por
+// la versión de opencode, falla silenciosamente (el toast ya muestra el
+// resultado).
+async function publishToSession(cli: any, sessionID: string, part: any): Promise<void> {
+  try {
+    await cli.session.prompt({
+      path: { id: sessionID },
+      body: {
+        noReply: true,
+        parts: [part],
+      },
+    })
+  } catch {
+    // noReply puede no estar soportado en todas las versiones. Fallback:
+    // próbally no llegó pero al menos el toast le avisó al usuario.
+  }
+}
+
 // ── Plugin ─────────────────────────────────────────────────────
 export const PreferFree: Plugin = async ({ client, $ }) => {
   // Fail a stuck/rate-limited session over to the next free candidate in the
@@ -779,6 +827,22 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
 
   // ── /code-review-free handler ─────────────────────────────
   // Swarm de code review: 3 modelos free en paralelo + consolidador.
+  //
+  // IMPORTANT: command.execute.before's output.parts becomes the prompt that
+  // the LLM processes —ocation the hook always triggers an LLM turn. This is
+  // documented as a limitation (issue anomalyco/opencode#9306 asked for a
+  // `noReply` field; not yet available in 1.17.x). So this handler is
+  // intentionally NON-blocking:
+  //   1. Parse + validate (fast, sync).
+  //   2. Set output.parts to a neutral "swarm started, coming soon" preamble
+  //      so the LLM has nothing interesting to act on.
+  //   3. Fire the heavy work as a detached Promise (fire-and-forget).
+  //   4. Post progress via client.tui.showToast (toasts don't block the TUI).
+  //   5. When done, deliver the consolidated review as a new message in the
+  //      session using client.session.prompt with noReply:true — this
+  //      inserts visible text without triggering another LLM turn.
+  //      (Workaround for #4475: explicitly pass the session's current model
+  //      so noReply doesn't trigger an agent-default model switch.)
   const runCodeReviewFree = async (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: any[] },
@@ -791,220 +855,236 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     const cleanArg = rawArg.replace(/\s--(?:post|bash)\b/g, "").trim()
 
     if (!cleanArg) {
-      output.parts = [{
-        type: "text",
-        text: [
-          "📖 /code-review-free — code review del PR con 3 modelos free en paralelo",
-          "",
-          "USO:",
-          "  /code-review-free <url>          → ej: https://github.com/owner/repo/pull/123",
-          "  /code-review-free <número>        → ej: 123 (usa el repo del cwd)",
-          "",
-          "FLAGS:",
-          "  --post    → sube el review como comentario en el PR (vía gh)",
-          "  --bash    → habilita bash para cada reviewer (default: read-only)",
-          "",
-          `HOW IT WORKS:`,
-          `  ${REVIEW_MAX_ROUNDS} rondas max de debate. Cada ronda, los 3 modelos`,
-          "  corren en paralelo y ven lo que dijeron los otros en la ronda",
-          "  anterior. Si convergen (ningún texto cambia >5%) corta antes.",
-          "  Al final un 4° modelo consolida todo en un único review.",
-          "",
-          "NUNCA usa paid. Si un free falla salta al siguiente de la lista.",
-        ].join("\n"),
-      } as any]
+      output.parts = [tp([
+        "📖 /code-review-free — code review del PR con 3 modelos free en paralelo",
+        "",
+        "USO:",
+        "  /code-review-free <url>          → ej: https://github.com/owner/repo/pull/123",
+        "  /code-review-free <número>        → ej: 123 (usa el repo del cwd)",
+        "",
+        "FLAGS:",
+        "  --post    → sube el review como comentario en el PR (vía gh)",
+        "  --bash    → habilita bash para cada reviewer (default: read-only)",
+        "",
+        `HOW IT WORKS:`,
+        `  ${REVIEW_MAX_ROUNDS} rondas max de debate. Cada ronda, los 3 modelos`,
+        "  corren en paralelo y ven lo que dijeron los otros en la ronda",
+        "  anterior. Si convergen (ningún texto cambia >5%) corta antes.",
+        "  Al final un 4° modelo consolida todo en un único review.",
+        "",
+        "NUNCA usa paid. Si un free falla salta al siguiente de la lista.",
+      ].join("\n"))]
       return
     }
 
     const parsed = parsePrArg(cleanArg)
     if (parsed.error) {
-      output.parts = [{ type: "text", text: "❌ " + parsed.error } as any]
+      output.parts = [tp("❌ " + parsed.error)]
       return
     }
 
-    // Preflight: gh y diff.
-    await cli.tui.showToast({
-      body: {
-        title: "code-review-free",
-        message: `Tirando diff del PR #${parsed.pr}${parsed.repo ? ` (${parsed.repo})` : ""}…`,
-        variant: "info",
-        duration: 4000,
-      },
-    }).catch(() => {})
+    // Parse arg OK. Fire the swarm in the background; show a neutral
+    // preamble in `output.parts` so the LLM turn ends quickly and the TUI
+    // comes back. Per the swarm spec from brave search (issue #9306), we
+    // cannot prevent the LLM from receiving this — but a neutral preamble
+    // encourages the model to just acknowledge and stop.
+    output.parts = [tp(
+      `🔄 **code-review-free** — PR #${parsed.pr}${parsed.repo ? ` (${parsed.repo})` : ""}\n` +
+      `Swarm iniciado en background. Vas a ver toasts de progreso y cuando` +
+      ` termine el review consolidado aparece acá mismo.\n` +
+      `_(este mensaje no necesita respuesta — podés seguir trabajando)_`,
+    )]
 
-    let pr = await fetchPr(shell, parsed.pr, parsed.repo)
-    if (!pr.diff) {
-      output.parts = [{
-        type: "text",
-        text: `❌ No pude sacar el diff del PR #${parsed.pr}. ¿gh está autenticado y el PR existe?`,
-      } as any]
-      return
-    }
-
-    // Limite de tamaño del diff para no volar el contexto del modelo.
-    const MAX_DIFF_CHARS = 60_000
-    let diff = pr.diff
-    let truncatedNote = ""
-    if (diff.length > MAX_DIFF_CHARS) {
-      diff = diff.slice(0, MAX_DIFF_CHARS)
-      truncatedNote = `\n\n>[el diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales) — revisa los archivos del PR completos con tus tools si hace falta]\n\n`
-    }
-
-    // Armar lista de 3 modelos free. Prefiere PREFERRED; completa con OTHER que
-    // estén disponibles. cachedAllFree viene del último config hook corrido.
-    const pick = (set: Set<string>, count: number): string[] => {
-      const out: string[] = []
-      for (const m of PREFERRED_REVIEW_MODELS) if (set.has(m) && out.length < count) out.push(m)
-      for (const m of OTHER_REVIEW_FREE) if (set.has(m) && out.length < count) out.push(m)
-      return out
-    }
-    const allFree = cachedAllFree.size
-      ? cachedAllFree
-      : new Set<string>([...PREFERRED_REVIEW_MODELS, ...OTHER_REVIEW_FREE])
-    let models = pick(allFree, 3)
-    if (models.length < 3) {
-      // última opción: Zen que están disponibles siempre.
-      for (const m of [...ZEN_FREE]) if (!models.includes(m) && models.length < 3) models.push(m)
-    }
-    if (models.length === 0) {
-      output.parts = [{
-        type: "text",
-        text: "❌ No encontré ningún modelo free para hacer code review. Corré /prefer-free refresh y volvé a intentar.",
-      } as any]
-      return
-    }
-
-    const reviewPrompt = [
-      `Estás revisando un Pull Request. Basate en el diff y los metadatos.`,
-      "Reglas:",
-      "- No repitas backticks fk de bloques ni pidasmv - sé concreto y corto.",
-      "- Para cada issue: `### severidad\nArchivos: paths:lines\nProblema:\n  …\nSugerencia:\n  …`",
-      "- Si no hay nada crítico, decí 1 palabra en la 1era línea antes de lo demás; no inventes.",
-      "- No proposes cambios que no estén relacionados al diff. Sé estricto.",
-      "- Si usás tools, leé nada más que los archivos del diff para ficharse del contexto.",
-      "",
-      `PR: ${pr.title}${pr.head ? ` (head: ${pr.head})` : ""}`,
-      "Descripción:",
-      (pr.body || "(sin descripción)").slice(0, 4000),
-      "",
-      "Diff:",
-      "```diff",
-      diff,
-      "```",
-      truncatedNote,
-    ].join("\n")
-
-    await cli.tui.showToast({
-      body: {
-        title: "code-review-free",
-        message: `Swarm de ${models.length} modelos · max ${REVIEW_MAX_ROUNDS} rondas: ${models.map(shortName).join(", ")}…`,
-        variant: "info",
-        duration: 6000,
-      },
-    }).catch(() => {})
-
-    const t0 = Date.now()
-
-    // Swarm por rondas. En cada ronda los 3 modelos corren EN PARALELO y
-    // reciben como contexto lo que dijeron todos en la ronda anterior (con
-    // su propio slot marcado como "VOS"). Convergencia: si ninguna opinión
-    // cambió entre dos rondas seguidas (Jaccard ≤ ~5%) cortamos antes.
-    let lastResults: ReviewResult[] = []
-    let roundIndex = 0
-    for (; roundIndex < REVIEW_MAX_ROUNDS; roundIndex++) {
-      const debateHeader =
-        roundIndex === 0
-          ? ""
-          : `\n\n## Ronda ${roundIndex + 1}/${REVIEW_MAX_ROUNDS} — debaté con los otros reviewers\n` +
-            `Debajo te paso lo que dijeron todos en la ronda anterior; **vos sos el reviewer marcado como "→ VOS"**.` +
-            ` Podés defender tu postura, aceptar puntos de otros o ajustar. Devolvé TU review ACTUALIZADO y completo.` +
-            ` No repostees lo que dijeron los otros — solo tu versión final de esta ronda.\n`
-
-      const roundResults = await Promise.all(
-        models.map((m, idx) => {
-          const peerContext =
-            roundIndex === 0
-              ? undefined
-              : buildPeerContext(roundIndex, lastResults, idx)
-          const prompt = reviewPrompt + debateHeader + (peerContext ? "\n" + peerContext : "")
-          return runReviewer(cli, input.sessionID, m, prompt, wantsBash)
-        }),
-      )
-
-      // Convergencia: mirar el delta textual de cada reviewer vs la ronda
-      // previa. Si ningún texto cambió significativamente, los reviewers ya
-      // están de acuerdo → corto.
-      let changedSignificantly = roundIndex === 0
-      if (roundIndex > 0) {
-        for (let i = 0; i < roundResults.length; i++) {
-          const delta = editDistanceRatio(
-            lastResults[i]?.text ?? "",
-            roundResults[i]?.text ?? "",
-          )
-          if (delta > 0.05) { changedSignificantly = true; break }
-        }
-      }
-      lastResults = roundResults
-      if (!changedSignificantly) break
-    }
-
-    // Consolidador: el primer free disponible (mismo orden que el review).
-    const merger = models[0] || PREFERRED_REVIEW_MODELS[0] || "opencode/glm-5-free"
-    const consolidated = await mergeReviews(
-      cli,
-      input.sessionID,
-      merger,
-      { title: pr.title, pr: parsed.pr, repo: parsed.repo },
-      lastResults,
-    )
-
-    const elapsedS = ((Date.now() - t0) / 1000).toFixed(1)
-    const header = [
-      `## ${pr.title}`,
-      ` PR #${parsed.pr}${parsed.repo ? ` · ${parsed.repo}` : ""} · ${models.length} modelos · ${roundIndex + 1} rondas · ${elapsedS}s`,
-      ``,
-      `Modelos usados:`,
-      ...lastResults.map(
-        (r, i) =>
-          `  ${i + 1}. ${shortName(r.model)} — ${
-            r.ok ? `✓ ${(r.elapsed / 1000).toFixed(1)}s` : `✗ ${r.error ?? "falló"} (${(r.elapsed / 1000).toFixed(1)}s)`
-          }`,
-      ),
-      ``,
-      `_Consolidado con ${shortName(merger)} · ${roundIndex + 1} rondas de debate_`,
-      ``,
-    ].join("\n")
-
-    const finalText = header + consolidated
-
-    // Postear a GitHub si se pidió.
-    if (wantsPost) {
+    // Detached: does NOT block the hook return. Errors are logged + toasted,
+    // never thrown into the hook's promise chain.
+    Promise.resolve().then(async () => {
+      const sessionID = input.sessionID
       try {
-        const repoFlag = parsed.repo ? `--repo ${parsed.repo}` : ""
-        // gh pr comment espera el body por stdin o --body. Usamos un temp file
-        // para no pelear con shell quoting.
-        const tmpPath = join(
-          process.env.HOME || "~",
-          ".config/opencode/.prefer-free-review.md",
-        )
-        writeFileSync(tmpPath, finalText)
-        await shell`gh pr comment ${parsed.pr} ${repoFlag} --body-file ${tmpPath}`.quiet()
-        try { await shell`rm -f ${tmpPath}`.quiet() } catch {}
-        output.parts = [{
-          type: "text",
-          text: `✅ Review posteado en el PR #${parsed.pr}\n\n${finalText}`,
-        } as any]
-        return
-      } catch (e: any) {
-        output.parts = [{
-          type: "text",
-          text: `❌ No pude postear el comentario en GitHub: ${e?.message ?? e}\n\n---(review de todos modos)---\n\n${finalText}`,
-        } as any]
-        return
-      }
-    }
+        // ── Etapa 1: fetch diff ──
+        await cli.tui.showToast({ body: {
+          title: "code-review-free",
+          message: `Tirando diff del PR #${parsed.pr}${parsed.repo ? ` (${parsed.repo})` : ""}…`,
+          variant: "info",
+          duration: 4000,
+        } }).catch(() => {})
 
-    output.parts = [{ type: "text", text: finalText } as any]
+        const pr = await fetchPr(shell, parsed.pr, parsed.repo)
+        if (!pr.diff) {
+          await cli.tui.showToast({ body: {
+            title: "code-review-free",
+            message: `❌ No pude sacar el diff del PR #${parsed.pr}. ¿gh auth y PR existe?`,
+            variant: "error",
+            duration: 8000,
+          } }).catch(() => {})
+          await publishToSession(cli, sessionID, tp(`❌ No pude sacar el diff del PR #${parsed.pr}. ¿gh está autenticado y el PR existe?`))
+          return
+        }
+
+        const MAX_DIFF_CHARS = 60_000
+        let diff = pr.diff
+        let truncatedNote = ""
+        if (diff.length > MAX_DIFF_CHARS) {
+          diff = diff.slice(0, MAX_DIFF_CHARS)
+          truncatedNote = `\n\n>[diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales)]\n\n`
+        }
+
+        // ── Etapa 2: pick 3 models ──
+        const pick = (set: Set<string>, count: number): string[] => {
+          const out: string[] = []
+          for (const m of PREFERRED_REVIEW_MODELS) if (set.has(m) && out.length < count) out.push(m)
+          for (const m of OTHER_REVIEW_FREE) if (set.has(m) && out.length < count) out.push(m)
+          return out
+        }
+        const allFree = cachedAllFree.size
+          ? cachedAllFree
+          : new Set<string>([...PREFERRED_REVIEW_MODELS, ...OTHER_REVIEW_FREE])
+        let models = pick(allFree, 3)
+        if (models.length < 3) {
+          for (const m of [...ZEN_FREE]) if (!models.includes(m) && models.length < 3) models.push(m)
+        }
+        if (models.length === 0) {
+          await cli.tui.showToast({ body: {
+            title: "code-review-free",
+            message: "❌ No hay modelos free. Corré /prefer-free refresh.",
+            variant: "error",
+            duration: 8000,
+          } }).catch(() => {})
+          await publishToSession(cli, sessionID, tp("❌ No encontré ningún modelo free para hacer code review. Corré /prefer-free refresh y volvé a intentar."))
+          return
+        }
+
+        const reviewPrompt = buildReviewPrompt(pr, diff, truncatedNote)
+
+        await cli.tui.showToast({ body: {
+          title: "code-review-free",
+          message: `Swarm ${models.length} modelos · max ${REVIEW_MAX_ROUNDS} rondas: ${models.map(shortName).join(", ")}…`,
+          variant: "info",
+          duration: 6000,
+        } }).catch(() => {})
+
+        cli.app.log({ body: {
+          service: "prefer-free",
+          level: "info",
+          message: `code-review-free: swarm ${models.length} modelos, PR #${parsed.pr}`,
+          extra: { models: models.map(shortName).join(", ") },
+        } }).catch(() => {})
+
+        // ── Etapa 3: debate rounds ──
+        const t0 = Date.now()
+        let lastResults: ReviewResult[] = []
+        let roundIndex = 0
+        for (; roundIndex < REVIEW_MAX_ROUNDS; roundIndex++) {
+          await cli.tui.showToast({ body: {
+            title: "code-review-free",
+            message: `Ronda ${roundIndex + 1}/${REVIEW_MAX_ROUNDS} — ${models.length} modelos en paralelo…`,
+            variant: "info",
+            duration: 5000,
+          } }).catch(() => {})
+
+          const debateHeader =
+            roundIndex === 0
+              ? ""
+              : `\n\n## Ronda ${roundIndex + 1}/${REVIEW_MAX_ROUNDS} — debaté con los otros reviewers\n` +
+                `Debajo te paso lo que dijeron todos en la ronda anterior; **vos sos el reviewer marcado como "→ VOS"**.` +
+                ` Podés defender tu postura, aceptar puntos de otros o ajustar.` +
+                ` Devolvé TU review ACTUALIZADO y completo. No repostees lo que dijeron los otros.\n`
+
+          const roundResults = await Promise.all(
+            models.map((m, idx) => {
+              const peerContext = roundIndex === 0 ? undefined : buildPeerContext(roundIndex, lastResults, idx)
+              const prompt = reviewPrompt + debateHeader + (peerContext ? "\n" + peerContext : "")
+              return runReviewer(cli, sessionID, m, prompt, wantsBash)
+            }),
+          )
+
+          let changedSignificantly = roundIndex === 0
+          if (roundIndex > 0) {
+            for (let i = 0; i < roundResults.length; i++) {
+              const delta = editDistanceRatio(lastResults[i]?.text ?? "", roundResults[i]?.text ?? "")
+              if (delta > 0.05) { changedSignificantly = true; break }
+            }
+          }
+          lastResults = roundResults
+          if (!changedSignificantly) break
+        }
+
+        // ── Etapa 4: consolidación ──
+        await cli.tui.showToast({ body: {
+          title: "code-review-free",
+          message: `Consolidando review con ${models.length} opiniones…`,
+          variant: "info",
+          duration: 5000,
+        } }).catch(() => {})
+
+        const merger = models[0] || PREFERRED_REVIEW_MODELS[0] || "opencode/glm-5-free"
+        const consolidated = await mergeReviews(
+          cli, sessionID, merger,
+          { title: pr.title, pr: parsed.pr, repo: parsed.repo },
+          lastResults,
+        )
+
+        const elapsedS = ((Date.now() - t0) / 1000).toFixed(1)
+        const header = [
+          `## ${pr.title}`,
+          ` PR #${parsed.pr}${parsed.repo ? ` · ${parsed.repo}` : ""} · ${models.length} modelos · ${roundIndex + 1} rondas · ${elapsedS}s`,
+          ``,
+          `Modelos usados:`,
+          ...lastResults.map((r, i) =>
+            `  ${i + 1}. ${shortName(r.model)} — ${
+              r.ok ? `✓ ${(r.elapsed / 1000).toFixed(1)}s` : `✗ ${r.error ?? "falló"} (${(r.elapsed / 1000).toFixed(1)}s)`
+            }`,
+          ),
+          ``,
+          `_Consolidado con ${shortName(merger)} · ${roundIndex + 1} rondas de debate_`,
+          ``,
+        ].join("\n")
+        const finalText = header + consolidated
+
+        // ── Etapa 5: postear / entregar ──
+        if (wantsPost) {
+          try {
+            const repoFlag = parsed.repo ? `--repo ${parsed.repo}` : ""
+            const tmpPath = join(process.env.HOME || "~", ".config/opencode/.prefer-free-review.md")
+            writeFileSync(tmpPath, finalText)
+            await shell`gh pr comment ${parsed.pr} ${repoFlag} --body-file ${tmpPath}`.quiet()
+            try { await shell`rm -f ${tmpPath}`.quiet() } catch {}
+            await cli.tui.showToast({ body: {
+              title: "code-review-free",
+              message: `✅ Review posteado en PR #${parsed.pr}`,
+              variant: "success",
+              duration: 6000,
+            } }).catch(() => {})
+          } catch (e: any) {
+            await cli.tui.showToast({ body: {
+              title: "code-review-free",
+              message: `❌ No pude postear el comentario: ${e?.message ?? e}`,
+              variant: "error",
+              duration: 8000,
+            } }).catch(() => {})
+          }
+        }
+
+        // Publish the review text in the session (visible to user) via
+        // noReply to avoid triggering another LLM turn.
+        await publishToSession(cli, sessionID, tp(finalText))
+
+        cli.app.log({ body: {
+          service: "prefer-free",
+          level: "info",
+          message: `code-review-free: done ${roundIndex + 1} rondas, ${elapsedS}s`,
+        } }).catch(() => {})
+      } catch (e: any) {
+        try {
+          await cli.tui.showToast({ body: {
+            title: "code-review-free",
+            message: `❌ Error inesperado: ${e?.message ?? e}`,
+            variant: "error",
+            duration: 10000,
+          } }).catch(() => {})
+          await publishToSession(cli, input.sessionID, tp(`❌ code-review-free falló: ${e?.message ?? e}`))
+        } catch {}
+      }
+    }).catch(() => {})
   }
 
   return {
