@@ -303,19 +303,33 @@ let cachedAllFree = new Set<string>()
 let cachedRuntimeModels = new Set<string>()
 let watchdogStarted = false
 
-async function refreshRuntimeModels(client: any): Promise<Set<string>> {
+async function refreshRuntimeModels(client: any, shell?: any): Promise<Set<string>> {
   const out = new Set<string>()
+  // 1) SDK: client.v2.model.list() — la vía barata cuando existe/responde.
   try {
     const listFn = client?.v2?.model?.list ?? client?.model?.list
-    if (!listFn) return out
-    const res: any = await listFn.call(client.v2?.model ?? client.model, {})
-    const models: any[] = res?.data?.data ?? res?.data ?? []
-    for (const m of models) {
-      const pid = m.providerID ?? m.provider
-      const id = m.id ?? m.modelID
-      if (pid && id) out.add(`${pid}/${id}`)
+    if (listFn) {
+      const res: any = await listFn.call(client.v2?.model ?? client.model, {})
+      const models: any[] = res?.data?.data ?? res?.data ?? []
+      for (const m of models) {
+        const pid = m.providerID ?? m.provider
+        const id = m.id ?? m.modelID
+        if (pid && id) out.add(`${pid}/${id}`)
+      }
     }
   } catch {}
+  // 2) Fallback: `opencode models` por shell. En algunas versiones/entornos
+  // el endpoint SDK devuelve vacío aunque el CLI lista todo — el CLI es la
+  // fuente de verdad de lo que realmente está registrado en runtime.
+  if (!out.size && shell) {
+    try {
+      const txt: string = await shell`opencode models`.nothrow().quiet().text()
+      for (const line of (txt || "").split("\n")) {
+        const t = line.trim()
+        if (t && t.includes("/") && !t.includes(" ")) out.add(t)
+      }
+    } catch {}
+  }
   return out
 }
 
@@ -478,15 +492,21 @@ function splitModel(ref: string): { providerID: string; modelID: string } {
   return { providerID: ref.slice(0, slash), modelID: ref.slice(slash + 1) }
 }
 
-// Sub-sessions de /code-review-free: solo modelos registrados en runtime.
-// Si refreshRuntimeModels falla (runtime vacío), no confiar en ids del catálogo
-// NIM/Zen hardcodeados — caer solo a ZEN_FREE conservador.
+// Sub-sessions de /code-review-free: preferimos modelos registrados en runtime.
+// Si NO pudimos leer el runtime (SDK vacío + shell falló), caemos a un set
+// CURADO y seguro (opencode/* de 2 segmentos que suelen estar registrados),
+// nunca al catálogo completo — eso reintroduciría ids fantasma (issue #2).
 function pickReviewModels(
   runtime: Set<string>,
   cachedFree: Set<string>,
   count = 3,
 ): string[] {
-  const inRuntime = (m: string) => runtime.size > 0 && runtime.has(m)
+  const runtimeKnown = runtime.size > 0
+  // Fallback seguro cuando no hay runtime: solo Zen 2-segmentos curados.
+  const safeFallback = new Set<string>([...PREFERRED_REVIEW_MODELS, ...ZEN_FREE])
+  const gate = runtimeKnown
+    ? (m: string) => runtime.has(m)
+    : (m: string) => safeFallback.has(m)
   const candidates = [
     ...PREFERRED_REVIEW_MODELS,
     ...OTHER_REVIEW_FREE,
@@ -498,7 +518,7 @@ function pickReviewModels(
   for (const m of candidates) {
     if (seen.has(m) || out.length >= count) continue
     seen.add(m)
-    if (!inRuntime(m)) continue
+    if (!gate(m)) continue
     out.push(m)
   }
   return out
@@ -1016,18 +1036,18 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           truncatedNote = `\n\n>[diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales)]\n\n`
         }
 
-        // ── Etapa 2: pick 3 models (runtime-validated, strict) ──
+        // ── Etapa 2: pick 3 models (runtime-validated, con fallback shell) ──
         let runtime = cachedRuntimeModels.size
           ? cachedRuntimeModels
-          : await refreshRuntimeModels(cli)
-        if (!runtime.size) runtime = await refreshRuntimeModels(cli)
+          : await refreshRuntimeModels(cli, shell)
+        if (!runtime.size) runtime = await refreshRuntimeModels(cli, shell)
         if (runtime.size) cachedRuntimeModels = runtime
 
         let models = pickReviewModels(runtime, cachedAllFree, 3)
         if (models.length === 0) {
           const hint = runtime.size
             ? "Ningún modelo free del catálogo está registrado en OpenCode."
-            : "No pude leer el registro de modelos de OpenCode (runtime vacío)."
+            : "No pude leer el registro de modelos de OpenCode (SDK + `opencode models` fallaron)."
           await cli.tui.showToast({ body: {
             title: "code-review-free",
             message: `❌ ${hint}`,
@@ -1425,7 +1445,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         refreshCatalog().catch(() => {})
       }
 
-      const runtime = await refreshRuntimeModels(client)
+      const runtime = await refreshRuntimeModels(client, $)
       if (runtime.size) cachedRuntimeModels = runtime
 
       // Union of free model ids, intersected with OpenCode's runtime registry
