@@ -929,15 +929,25 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         }
 
         // ── Etapa 2: pick 3 models ──
+        // code-review-free es independiente de prefer-free ON/OFF: arma su
+        // propia lista de modelos free sin depender de cachedAllFree (que
+        // solo se llena si prefer-free está ON). Si cachedAllFree tiene
+        // datos los aprovecha (mejor: incluye lo que el catálogo refrescó),
+        // si no, usa la lista hardcoded de PREFERRED + OTHER + ZEN.
         const pick = (set: Set<string>, count: number): string[] => {
           const out: string[] = []
           for (const m of PREFERRED_REVIEW_MODELS) if (set.has(m) && out.length < count) out.push(m)
           for (const m of OTHER_REVIEW_FREE) if (set.has(m) && out.length < count) out.push(m)
           return out
         }
-        const allFree = cachedAllFree.size
-          ? cachedAllFree
-          : new Set<string>([...PREFERRED_REVIEW_MODELS, ...OTHER_REVIEW_FREE])
+        // Union: lo que cachedAllFree tenga (si prefer-free está ON) +
+        // siempre los hardcoded. Así funciona con o sin prefer-free.
+        const allFree = new Set<string>([
+          ...PREFERRED_REVIEW_MODELS,
+          ...OTHER_REVIEW_FREE,
+          ...ZEN_FREE,
+          ...(cachedAllFree.size ? [...cachedAllFree] : []),
+        ])
         let models = pick(allFree, 3)
         if (models.length < 3) {
           for (const m of [...ZEN_FREE]) if (!models.includes(m) && models.length < 3) models.push(m)
@@ -945,11 +955,11 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         if (models.length === 0) {
           await cli.tui.showToast({ body: {
             title: "code-review-free",
-            message: "❌ No hay modelos free. Corré /prefer-free refresh.",
+            message: "❌ No hay modelos free disponibles.",
             variant: "error",
             duration: 8000,
           } }).catch(() => {})
-          await publishToSession(cli, sessionID, tp("❌ No encontré ningún modelo free para hacer code review. Corré /prefer-free refresh y volvé a intentar."))
+          await publishToSession(cli, sessionID, tp("❌ No encontré ningún modelo free para hacer code review."))
           return
         }
 
