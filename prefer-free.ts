@@ -175,6 +175,7 @@ const FREE_EQUIVALENTS: Record<string, string[]> = {
     "opencode/mimo-v2.5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
     "opencode/nemotron-3-super-free",
+    "opencode/glm-5-free",
   ],
   "opencode-go/qwen3.5-plus": [
     "nvidia/qwen/qwen3.5-122b-a10b",
@@ -182,6 +183,7 @@ const FREE_EQUIVALENTS: Record<string, string[]> = {
     "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
     "opencode/deepseek-v4-flash-free",
     "opencode/mimo-v2.5-free",
+    "opencode/glm-5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
   ],
   "opencode-go/kimi-k2.6": [
@@ -190,6 +192,7 @@ const FREE_EQUIVALENTS: Record<string, string[]> = {
     "nvidia/deepseek-ai/deepseek-v4-flash",
     "opencode/mimo-v2.5-free",
     "opencode/deepseek-v4-flash-free",
+    "opencode/glm-5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
   ],
   "opencode-go/deepseek-v4-pro": [
@@ -198,6 +201,15 @@ const FREE_EQUIVALENTS: Record<string, string[]> = {
     "nvidia/nvidia/nemotron-3-super-120b-a12b",
     "nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5",
     "opencode/nemotron-3-super-free",
+    "opencode/glm-5-free",
+    "nvidia/meta/llama-3.3-70b-instruct",
+  ],
+  "opencode-go/glm-5.2": [
+    "nvidia/z-ai/glm-5.2",
+    "opencode/glm-5-free",
+    "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
+    "opencode/deepseek-v4-flash-free",
+    "opencode/mimo-v2.5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
   ],
 }
@@ -224,6 +236,7 @@ const ZEN_FREE = new Set([
   "opencode/deepseek-v4-flash-free",
   "opencode/mimo-v2.5-free",
   "opencode/nemotron-3-super-free",
+  "opencode/glm-5-free",
   "opencode/big-pickle",
 ])
 
@@ -356,8 +369,295 @@ function shortName(model: string): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+// ── /code-review-free: swarm de code review con 3 modelos free ────
+//
+// Recibe un PR (URL de GitHub o número del repo actual), saca el diff, hace
+// que 3 modelos free distintos lo revisen EN PARALELO (cada uno en su propia
+// sub-session, con tools de lectura), y consolida los hallazgos en un único
+// review. Por defecto lo muestra en la TUI; con --post lo sube como comentario
+// al PR usando gh.
+//
+// Cómo elige los 3 modelos: parte de PREFERRED_REVIEW_MODELS (lo mejor de los
+// free — GLM-5.2, Kimi K2.6, DeepSeek V4-Pro) y va bajando a los "buenos para
+// código" si alguno no está disponible. Nunca usa paid.
+const PREFERRED_REVIEW_MODELS: string[] = [
+  "nvidia/z-ai/glm-5.2",
+  "nvidia/moonshotai/kimi-k2.6",
+  "nvidia/deepseek-ai/deepseek-v4-pro",
+]
+
+const OTHER_REVIEW_FREE: string[] = [
+  "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
+  "nvidia/qwen/qwen3.5-397b-a17b",
+  "nvidia/deepseek-ai/deepseek-v4-flash",
+  "opencode/glm-5-free",
+  "opencode/deepseek-v4-flash-free",
+  "opencode/mimo-v2.5-free",
+  "nvidia/meta/llama-3.3-70b-instruct",
+]
+
+const REVIEW_TIMEOUT_MS = 5 * 60 * 1000 // cada modelo tiene 5 min para terminar (por ronda)
+const REVIEW_POLL_MS = 2_500
+const REVIEW_MAX_ROUNDS = 3 // rondas de debate entre los reviewers antes de consolidar
+
+type ReviewResult = {
+  model: string // "nvidia/..."
+  ok: boolean
+  text: string // texto final (lo que puso el modelo como conclusión)
+  error?: string
+  elapsed: number
+}
+
+// Helper para construir parts del output sin pelear con el SDK que a partir
+// de v1.17 pide ids en TextPart aún para outputs (en runtime cualquier objeto
+// con type+text funciona).
+const tp = (text: string): any => ({ type: "text", text })
+
+function splitModel(ref: string): { providerID: string; modelID: string } {
+  const slash = ref.indexOf("/")
+  return { providerID: ref.slice(0, slash), modelID: ref.slice(slash + 1) }
+}
+
+// Parsea "URL o número" y devuelve { repo: "owner/repo" | null, pr: number }
+function parsePrArg(arg: string): { repo: string | null; pr: number; error?: string } {
+  const trimmed = arg.trim()
+  // https://github.com/owner/repo/pull/123
+  const m = trimmed.match(/github\.com\/([^\/]+\/[^\/]+)\/pull\/(\d+)/i)
+  if (m) return { repo: m[1], pr: parseInt(m[2], 10) }
+  // 123
+  if (/^\d+$/.test(trimmed)) return { repo: null, pr: parseInt(trimmed, 10) }
+  return { repo: null, pr: 0, error: "argumento inválido — pasá una URL o un número de PR" }
+}
+
+// Llamada blocking a gh para sacar metadata + diff del PR.
+async function fetchPr(
+  $: any,
+  pr: number,
+  repo: string | null,
+): Promise<{ title: string; body: string; base: string; head: string; diff: string; repo: string | null }> {
+  const repoFlag = repo ? `--repo ${repo}` : ""
+  const metaJson = await $`gh pr view ${pr} ${repoFlag} --json title,body,baseRefName,headRefName,headRepository`
+    .quiet().text()
+  let meta: any = {}
+  try { meta = JSON.parse(metaJson || "{}") } catch {}
+  const diff = await $`gh pr diff ${pr} ${repoFlag}`.quiet().text().catch(() => "") as string
+  const head = meta?.headRepository?.name
+    ? `${meta.headRepository.name}:${meta.headRefName}`
+    : (meta?.headRefName ?? "")
+  return {
+    title: meta?.title ?? `PR #${pr}`,
+    body: (meta?.body ?? "").toString(),
+    base: meta?.baseRefName ?? "",
+    head,
+    diff: diff || "",
+    repo,
+  }
+}
+
+// Corre 1 modelo free contra el mismo prompt en una sub-session hija. Devuelve
+// el texto final del assistant (mass result) o el error. Nunca toca estado
+// global del PreferFree. `peerContext` (si hay) es lo que dijeron los otros
+// reviewers en la ronda previa — el modelo puede defenderse o cambiar de idea.
+async function runReviewer(
+  client: any,
+  parentSessionID: string,
+  modelRef: string,
+  prompt: string,
+  allowBash: boolean,
+  peerContext?: string,
+): Promise<ReviewResult> {
+  const startedAt = Date.now()
+  const tools: Record<string, boolean> = {
+    read: true,
+    glob: true,
+    grep: true,
+    task: false,
+    edit: false,
+    write: false,
+    bash: allowBash,
+    webfetch: false,
+    websearch: false,
+  }
+  const fullPrompt = peerContext
+    ? prompt + "\n\n" + peerContext
+    : prompt
+  try {
+    const { providerID, modelID } = splitModel(modelRef)
+    const created: any = await client.session.create({
+      body: { parentID: parentSessionID, title: `review:${shortName(modelRef)}` },
+    })
+    const sid: string = created?.data?.id ?? created?.id
+    if (!sid) throw new Error("session.create devolvió sin id")
+
+    await client.session.promptAsync({
+      path: { id: sid },
+      body: {
+        model: { providerID, modelID },
+        agent: "explore",
+        tools,
+        parts: [{ type: "text", text: prompt }],
+      },
+    })
+
+    // Poll status hasta idle o timeout. Sin usar el event bus para no pisar
+    // el handler global del PreferFree; cheap & robust.
+    const deadline = Date.now() + REVIEW_TIMEOUT_MS
+    let lastStatus = "busy"
+    while (Date.now() < deadline) {
+      await sleep(REVIEW_POLL_MS)
+      const st: any = await client.session.status({ path: { id: sid } })
+      const status = st?.data?.type ?? st?.data?.status ?? st?.status
+      lastStatus = status ?? lastStatus
+      if (lastStatus === "idle") break
+      if (lastStatus === "error") throw new Error("session.status=error")
+    }
+    if (lastStatus !== "idle") {
+      // Timeout: abortamos y reportamos.
+      await client.session.abort({ path: { id: sid } }).catch(() => {})
+      return { model: modelRef, ok: false, text: "", error: "timeout", elapsed: Date.now() - startedAt }
+    }
+
+    const msgsRes: any = await client.session.messages({ path: { id: sid } })
+    const msgs: any[] = msgsRes?.data ?? (Array.isArray(msgsRes) ? msgsRes : [])
+    let text = ""
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.info?.role === "assistant") {
+        for (const p of msgs[i].parts ?? []) {
+          if (p?.type === "text" && p.text) text += p.text + "\n"
+        }
+        break
+      }
+    }
+    return {
+      model: modelRef,
+      ok: !!text.trim(),
+      text: text.trim() || "(sin output del modelo)",
+      elapsed: Date.now() - startedAt,
+    }
+  } catch (e: any) {
+    return {
+      model: modelRef,
+      ok: false,
+      text: "",
+      error: e?.message ?? String(e),
+      elapsed: Date.now() - startedAt,
+    }
+  }
+}
+
+// Consolida los N reviews en un único review final con un modelo "mergeer".
+async function mergeReviews(
+  client: any,
+  sessionID: string,
+  mergerModel: string,
+  prInfo: { title: string; pr: number; repo: string | null },
+  results: ReviewResult[],
+): Promise<string> {
+  const summaries = results
+    .map((r, i) => {
+      const head = `### Reviewer ${i + 1} — ${shortName(r.model)} ${r.ok ? "" : "(FALLÓ: " + (r.error ?? "?") + ")"}`
+      return `${head}\n\n${r.ok ? r.text : "—"}`
+    })
+    .join("\n\n---\n\n")
+
+  const prompt = [
+    `PR #${prInfo.pr}${prInfo.repo ? ` (${prInfo.repo})` : ""}: ${prInfo.title}`,
+    "",
+    "Reuní los ${N} reviews estos en UN solo review final.",
+    "Reglas:",
+    "- Duplicá cada issue en una sola línea. No inventes issues que no aparezcan abajo.",
+    "- Ordená por severidad: Bloqueante > Importante > Menor > Pregunta.",
+    "- Si los reviewers se contradicen entre sí, dejá una sola recomendación con _(conflicto: X vs Y)_ notado.",
+    "- Clarito y en español. M arbe.",
+    "- Fuera del texto del review no agregues nada (sin proemio, sin colofón) — el code reviewer lo va a pegar directamente.",
+    "",
+    "Empezá el review con: ## Review consolidado (PR #" + prInfo.pr + ")",
+    "",
+    "Reviews:",
+    summaries,
+  ].join("\n")
+
+  try {
+    const { providerID, modelID } = splitModel(mergerModel)
+    const created: any = await client.session.create({
+      body: { parentID: sessionID, title: "review:consolidador" },
+    })
+    const sid = created?.data?.id ?? created?.id
+    await client.session.promptAsync({
+      path: { id: sid },
+      body: {
+        model: { providerID, modelID },
+        agent: "explore",
+        tools: { read: false, glob: false, grep: false, task: false, edit: false, write: false, bash: false },
+        parts: [{ type: "text", text: prompt }],
+      },
+    })
+    const deadline = Date.now() + REVIEW_TIMEOUT_MS
+    let status = "busy"
+    while (Date.now() < deadline) {
+      await sleep(REVIEW_POLL_MS)
+      const st: any = await client.session.status({ path: { id: sid } })
+      status = st?.data?.type ?? st?.data?.status ?? status
+      if (status === "idle") break
+      if (status === "error") break
+    }
+    await client.session.abort({ path: { id: sid } }).catch(() => {})
+    const msgsRes: any = await client.session.messages({ path: { id: sid } })
+    const msgs: any[] = msgsRes?.data ?? (Array.isArray(msgsRes) ? msgsRes : [])
+    let text = ""
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.info?.role === "assistant") {
+        for (const p of msgs[i].parts ?? []) {
+          if (p?.type === "text" && p.text) text += p.text + "\n"
+        }
+        break
+      }
+    }
+    return text.trim() || "(el consolidador no devolvió texto)"
+  } catch {
+    return summaries || "(sin reviews para consolidar)"
+  }
+}
+
+// Construye el bloque "lo que dijeron los otros" que se le pasa a cada reviewer
+// en la ronda N>0. Cada reviewer ve TODAS las opiniones (con su propio nombre
+// marcado), para que pueda defender o ajustar su postura.
+function buildPeerContext(round: number, results: ReviewResult[], selfIdx?: number): string {
+  const lines = [
+    `---`,
+    `RONDA ${round} — opiniones de los reviewers (ronda anterior):`,
+    ``,
+  ]
+  results.forEach((r, i) => {
+    const tag = i === selfIdx ? " → VOS" : ""
+    lines.push(`### Reviewer ${i + 1} — ${shortName(r.model)}${tag}${r.ok ? "" : " (FALLÓ: " + (r.error ?? "?") + ")"}`)
+    lines.push("")
+    lines.push(r.ok ? r.text : "—")
+    lines.push("")
+  })
+  lines.push(`---`)
+  return lines.join("\n")
+}
+
+// Ratio de "cuánto cambió" entre dos textos. 0 = idéntico, 1 = completamente
+// distinto. Aproximación barata: #tokens borrados+insertados / (a+b)/2.
+// Suficiente para detectar convergencia en el swarm.
+function editDistanceRatio(a: string, b: string): number {
+  if (!a && !b) return 0
+  if (!a || !b) return 1
+  const ta = a.split(/\s+/).filter(Boolean)
+  const tb = b.split(/\s+/).filter(Boolean)
+  const setA = new Set(ta)
+  const setB = new Set(tb)
+  let common = 0
+  for (const w of setA) if (setB.has(w)) common++
+  const union = setA.size + setB.size - common
+  if (union === 0) return 0
+  return 1 - common / union
+}
+
 // ── Plugin ─────────────────────────────────────────────────────
-export const PreferFree: Plugin = async ({ client }) => {
+export const PreferFree: Plugin = async ({ client, $ }) => {
   // Fail a stuck/rate-limited session over to the next free candidate in the
   // same chain: abort → revert to last user turn → re-prompt with a new model.
   const failover = async (sessionID: string, reason: string) => {
@@ -477,6 +777,236 @@ export const PreferFree: Plugin = async ({ client }) => {
     ;(h as any)?.unref?.() // don't keep the process alive on our account
   }
 
+  // ── /code-review-free handler ─────────────────────────────
+  // Swarm de code review: 3 modelos free en paralelo + consolidador.
+  const runCodeReviewFree = async (
+    input: { command: string; sessionID: string; arguments: string },
+    output: { parts: any[] },
+    cli: any,
+    shell: any,
+  ) => {
+    const rawArg = (input.arguments || "").trim()
+    const wantsPost = /\s--post\b/.test(rawArg)
+    const wantsBash = /\s--bash\b/.test(rawArg)
+    const cleanArg = rawArg.replace(/\s--(?:post|bash)\b/g, "").trim()
+
+    if (!cleanArg) {
+      output.parts = [{
+        type: "text",
+        text: [
+          "📖 /code-review-free — code review del PR con 3 modelos free en paralelo",
+          "",
+          "USO:",
+          "  /code-review-free <url>          → ej: https://github.com/owner/repo/pull/123",
+          "  /code-review-free <número>        → ej: 123 (usa el repo del cwd)",
+          "",
+          "FLAGS:",
+          "  --post    → sube el review como comentario en el PR (vía gh)",
+          "  --bash    → habilita bash para cada reviewer (default: read-only)",
+          "",
+          `HOW IT WORKS:`,
+          `  ${REVIEW_MAX_ROUNDS} rondas max de debate. Cada ronda, los 3 modelos`,
+          "  corren en paralelo y ven lo que dijeron los otros en la ronda",
+          "  anterior. Si convergen (ningún texto cambia >5%) corta antes.",
+          "  Al final un 4° modelo consolida todo en un único review.",
+          "",
+          "NUNCA usa paid. Si un free falla salta al siguiente de la lista.",
+        ].join("\n"),
+      } as any]
+      return
+    }
+
+    const parsed = parsePrArg(cleanArg)
+    if (parsed.error) {
+      output.parts = [{ type: "text", text: "❌ " + parsed.error } as any]
+      return
+    }
+
+    // Preflight: gh y diff.
+    await cli.tui.showToast({
+      body: {
+        title: "code-review-free",
+        message: `Tirando diff del PR #${parsed.pr}${parsed.repo ? ` (${parsed.repo})` : ""}…`,
+        variant: "info",
+        duration: 4000,
+      },
+    }).catch(() => {})
+
+    let pr = await fetchPr(shell, parsed.pr, parsed.repo)
+    if (!pr.diff) {
+      output.parts = [{
+        type: "text",
+        text: `❌ No pude sacar el diff del PR #${parsed.pr}. ¿gh está autenticado y el PR existe?`,
+      } as any]
+      return
+    }
+
+    // Limite de tamaño del diff para no volar el contexto del modelo.
+    const MAX_DIFF_CHARS = 60_000
+    let diff = pr.diff
+    let truncatedNote = ""
+    if (diff.length > MAX_DIFF_CHARS) {
+      diff = diff.slice(0, MAX_DIFF_CHARS)
+      truncatedNote = `\n\n>[el diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales) — revisa los archivos del PR completos con tus tools si hace falta]\n\n`
+    }
+
+    // Armar lista de 3 modelos free. Prefiere PREFERRED; completa con OTHER que
+    // estén disponibles. cachedAllFree viene del último config hook corrido.
+    const pick = (set: Set<string>, count: number): string[] => {
+      const out: string[] = []
+      for (const m of PREFERRED_REVIEW_MODELS) if (set.has(m) && out.length < count) out.push(m)
+      for (const m of OTHER_REVIEW_FREE) if (set.has(m) && out.length < count) out.push(m)
+      return out
+    }
+    const allFree = cachedAllFree.size
+      ? cachedAllFree
+      : new Set<string>([...PREFERRED_REVIEW_MODELS, ...OTHER_REVIEW_FREE])
+    let models = pick(allFree, 3)
+    if (models.length < 3) {
+      // última opción: Zen que están disponibles siempre.
+      for (const m of [...ZEN_FREE]) if (!models.includes(m) && models.length < 3) models.push(m)
+    }
+    if (models.length === 0) {
+      output.parts = [{
+        type: "text",
+        text: "❌ No encontré ningún modelo free para hacer code review. Corré /prefer-free refresh y volvé a intentar.",
+      } as any]
+      return
+    }
+
+    const reviewPrompt = [
+      `Estás revisando un Pull Request. Basate en el diff y los metadatos.`,
+      "Reglas:",
+      "- No repitas backticks fk de bloques ni pidasmv - sé concreto y corto.",
+      "- Para cada issue: `### severidad\nArchivos: paths:lines\nProblema:\n  …\nSugerencia:\n  …`",
+      "- Si no hay nada crítico, decí 1 palabra en la 1era línea antes de lo demás; no inventes.",
+      "- No proposes cambios que no estén relacionados al diff. Sé estricto.",
+      "- Si usás tools, leé nada más que los archivos del diff para ficharse del contexto.",
+      "",
+      `PR: ${pr.title}${pr.head ? ` (head: ${pr.head})` : ""}`,
+      "Descripción:",
+      (pr.body || "(sin descripción)").slice(0, 4000),
+      "",
+      "Diff:",
+      "```diff",
+      diff,
+      "```",
+      truncatedNote,
+    ].join("\n")
+
+    await cli.tui.showToast({
+      body: {
+        title: "code-review-free",
+        message: `Swarm de ${models.length} modelos · max ${REVIEW_MAX_ROUNDS} rondas: ${models.map(shortName).join(", ")}…`,
+        variant: "info",
+        duration: 6000,
+      },
+    }).catch(() => {})
+
+    const t0 = Date.now()
+
+    // Swarm por rondas. En cada ronda los 3 modelos corren EN PARALELO y
+    // reciben como contexto lo que dijeron todos en la ronda anterior (con
+    // su propio slot marcado como "VOS"). Convergencia: si ninguna opinión
+    // cambió entre dos rondas seguidas (Jaccard ≤ ~5%) cortamos antes.
+    let lastResults: ReviewResult[] = []
+    let roundIndex = 0
+    for (; roundIndex < REVIEW_MAX_ROUNDS; roundIndex++) {
+      const debateHeader =
+        roundIndex === 0
+          ? ""
+          : `\n\n## Ronda ${roundIndex + 1}/${REVIEW_MAX_ROUNDS} — debaté con los otros reviewers\n` +
+            `Debajo te paso lo que dijeron todos en la ronda anterior; **vos sos el reviewer marcado como "→ VOS"**.` +
+            ` Podés defender tu postura, aceptar puntos de otros o ajustar. Devolvé TU review ACTUALIZADO y completo.` +
+            ` No repostees lo que dijeron los otros — solo tu versión final de esta ronda.\n`
+
+      const roundResults = await Promise.all(
+        models.map((m, idx) => {
+          const peerContext =
+            roundIndex === 0
+              ? undefined
+              : buildPeerContext(roundIndex, lastResults, idx)
+          const prompt = reviewPrompt + debateHeader + (peerContext ? "\n" + peerContext : "")
+          return runReviewer(cli, input.sessionID, m, prompt, wantsBash)
+        }),
+      )
+
+      // Convergencia: mirar el delta textual de cada reviewer vs la ronda
+      // previa. Si ningún texto cambió significativamente, los reviewers ya
+      // están de acuerdo → corto.
+      let changedSignificantly = roundIndex === 0
+      if (roundIndex > 0) {
+        for (let i = 0; i < roundResults.length; i++) {
+          const delta = editDistanceRatio(
+            lastResults[i]?.text ?? "",
+            roundResults[i]?.text ?? "",
+          )
+          if (delta > 0.05) { changedSignificantly = true; break }
+        }
+      }
+      lastResults = roundResults
+      if (!changedSignificantly) break
+    }
+
+    // Consolidador: el primer free disponible (mismo orden que el review).
+    const merger = models[0] || PREFERRED_REVIEW_MODELS[0] || "opencode/glm-5-free"
+    const consolidated = await mergeReviews(
+      cli,
+      input.sessionID,
+      merger,
+      { title: pr.title, pr: parsed.pr, repo: parsed.repo },
+      lastResults,
+    )
+
+    const elapsedS = ((Date.now() - t0) / 1000).toFixed(1)
+    const header = [
+      `## ${pr.title}`,
+      ` PR #${parsed.pr}${parsed.repo ? ` · ${parsed.repo}` : ""} · ${models.length} modelos · ${roundIndex + 1} rondas · ${elapsedS}s`,
+      ``,
+      `Modelos usados:`,
+      ...lastResults.map(
+        (r, i) =>
+          `  ${i + 1}. ${shortName(r.model)} — ${
+            r.ok ? `✓ ${(r.elapsed / 1000).toFixed(1)}s` : `✗ ${r.error ?? "falló"} (${(r.elapsed / 1000).toFixed(1)}s)`
+          }`,
+      ),
+      ``,
+      `_Consolidado con ${shortName(merger)} · ${roundIndex + 1} rondas de debate_`,
+      ``,
+    ].join("\n")
+
+    const finalText = header + consolidated
+
+    // Postear a GitHub si se pidió.
+    if (wantsPost) {
+      try {
+        const repoFlag = parsed.repo ? `--repo ${parsed.repo}` : ""
+        // gh pr comment espera el body por stdin o --body. Usamos un temp file
+        // para no pelear con shell quoting.
+        const tmpPath = join(
+          process.env.HOME || "~",
+          ".config/opencode/.prefer-free-review.md",
+        )
+        writeFileSync(tmpPath, finalText)
+        await shell`gh pr comment ${parsed.pr} ${repoFlag} --body-file ${tmpPath}`.quiet()
+        try { await shell`rm -f ${tmpPath}`.quiet() } catch {}
+        output.parts = [{
+          type: "text",
+          text: `✅ Review posteado en el PR #${parsed.pr}\n\n${finalText}`,
+        } as any]
+        return
+      } catch (e: any) {
+        output.parts = [{
+          type: "text",
+          text: `❌ No pude postear el comentario en GitHub: ${e?.message ?? e}\n\n---(review de todos modos)---\n\n${finalText}`,
+        } as any]
+        return
+      }
+    }
+
+    output.parts = [{ type: "text", text: finalText } as any]
+  }
+
   return {
     // Detect stuck/rate-limited sessions and track activity for the watchdog.
     event: async ({ event }) => {
@@ -553,6 +1083,10 @@ export const PreferFree: Plugin = async ({ client }) => {
     },
 
     "command.execute.before": async (input, output) => {
+      if (input.command === "code-review-free") {
+        await runCodeReviewFree(input, output, client, $)
+        return
+      }
       if (input.command !== "prefer-free") return
 
       const arg = input.arguments.trim().toLowerCase()
@@ -563,7 +1097,7 @@ export const PreferFree: Plugin = async ({ client }) => {
         output.parts = [{
           type: "text",
           text: "✅ PreferFree ON — se usarán modelos free cuando sea posible",
-        }]
+        } as any]
         return
       }
 
@@ -572,7 +1106,7 @@ export const PreferFree: Plugin = async ({ client }) => {
         output.parts = [{
           type: "text",
           text: "❌ PreferFree OFF — se usarán los modelos originales (opencode-go)",
-        }]
+        } as any]
         return
       }
 
@@ -581,7 +1115,7 @@ export const PreferFree: Plugin = async ({ client }) => {
         output.parts = [{
           type: "text",
           text: "🔁 Failover ON — si un modelo free se tranca (rate-limit/cuelgue) reintenta la task con el siguiente free de la cadena",
-        }]
+        } as any]
         return
       }
 
@@ -590,7 +1124,7 @@ export const PreferFree: Plugin = async ({ client }) => {
         output.parts = [{
           type: "text",
           text: "⏹️  Failover OFF — no se reintenta automáticamente; si un free se tranca queda como está",
-        }]
+        } as any]
         return
       }
 
@@ -598,7 +1132,7 @@ export const PreferFree: Plugin = async ({ client }) => {
         output.parts = [{
           type: "text",
           text: `Failover está ${state.failover === false ? "⏹️ OFF" : "🔁 ON"}\n  /prefer-free failover on|off`,
-        }]
+        } as any]
         return
       }
 
@@ -609,7 +1143,7 @@ export const PreferFree: Plugin = async ({ client }) => {
           text: log
             ? log.split("\n").filter(Boolean).slice(-30).join("\n")
             : "(sin swaps registrados aún)",
-        }]
+        } as any]
         return
       }
 
@@ -618,7 +1152,7 @@ export const PreferFree: Plugin = async ({ client }) => {
         output.parts = [{
           type: "text",
           text: "🧹 Log limpiado",
-        }]
+        } as any]
         return
       }
 
@@ -634,7 +1168,7 @@ export const PreferFree: Plugin = async ({ client }) => {
             ``,
             `Diff vs anterior queda en /prefer-free log`,
           ].join("\n"),
-        }]
+        } as any]
         return
       }
 
@@ -644,7 +1178,7 @@ export const PreferFree: Plugin = async ({ client }) => {
           output.parts = [{
             type: "text",
             text: "(sin catalog cacheado — corré /prefer-free refresh)",
-          }]
+          } as any]
           return
         }
         const ageH = Math.round(((Date.now() - cat.fetchedAt) / 36e5) * 10) / 10
@@ -662,7 +1196,7 @@ export const PreferFree: Plugin = async ({ client }) => {
           `Zen (${cat.zen.length}):`,
           ...cat.zen.map((m) => `  ${m}`),
         ].filter(Boolean)
-        output.parts = [{ type: "text", text: lines.join("\n") }]
+        output.parts = [{ type: "text", text: lines.join("\n") } as any]
         return
       }
 
@@ -697,14 +1231,14 @@ export const PreferFree: Plugin = async ({ client }) => {
             "",
             "NVIDIA NIM: requiere export NVIDIA_API_KEY=nvapi-...",
           ].join("\n"),
-        }]
+        } as any]
         return
       }
 
       output.parts = [{
         type: "text",
         text: `PreferFree está ${state.enabled ? "✅ ON" : "❌ OFF"}\n/prefer-free help  → ayuda completa`,
-      }]
+      } as any]
     },
 
     config: async (config) => {

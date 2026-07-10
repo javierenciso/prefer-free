@@ -2,7 +2,9 @@
 
 An **OpenCode plugin** that swaps paid `opencode-go/*` models for free ones, automatically, every time you start a session. You save credits without doing anything.
 
-Whenever possible it picks the **exact same model on a free tier**. NVIDIA NIM hosts the same `kimi-k2.6`, `deepseek-v4-flash`, `deepseek-v4-pro`, etc. for free (with rate limits). If those aren't available, it falls back to OpenRouter `:free` models and OpenCode Zen free models.
+Whenever possible it picks the **exact same model on a free tier**. NVIDIA NIM hosts the same `kimi-k2.6`, `deepseek-v4-flash`, `deepseek-v4-pro`, `glm-5.2`, etc. for free (with rate limits). If those aren't available, it falls back to OpenRouter `:free` models and OpenCode Zen free models.
+
+It also ships **`/code-review-free`**: a swarm code-review command that spins up 3 free models in parallel, lets them debate a PR diff for up to 3 rounds, and consolidates the feedback — all on free models, no credits spent.
 
 ## What it does
 
@@ -38,6 +40,45 @@ When it retries, it stops the stuck attempt, goes back to your last message, and
 
 If **every free model in the list has failed**, the plugin shows a notification and pauses the session so you can pick a model yourself. It **never quietly switches back to the paid model**. You can turn this whole feature on or off with `/prefer-free failover on|off` (it's on by default), and every retry shows up in `/prefer-free log`.
 
+## `/code-review-free` — swarm code review
+
+A built-in command that reviews a GitHub PR using **3 free models** debating with each other — no paid credits spent.
+
+### Usage
+
+```
+/code-review-free <url>
+/code-review-free <pr-number>
+/code-review-free <url-or-number> --post
+/code-review-free <url-or-number> --bash
+```
+
+- **URL** — `https://github.com/owner/repo/pull/123`
+- **PR number** — uses the repo from your current working directory (via `gh`)
+- **`--post`** — uploads the consolidated review as a comment on the PR (via `gh pr comment`)
+- **`--bash`** — lets each reviewer run `bash` (default: read-only — `read`, `glob`, `grep` only)
+
+### How it works
+
+1. **Fetches the diff** via `gh pr diff` (+ metadata via `gh pr view --json`). Diffs over 60k chars are truncated.
+2. **Picks 3 free models** — prefers GLM-5.2, Kimi K2.6, DeepSeek V4-Pro on NVIDIA NIM; falls back to Qwen3 Coder 480B, Qwen3.5 397B, Zen free models, etc. Reuses the same `cachedAllFree` set that `/prefer-free` maintains.
+3. **Debate — max 3 rounds**:
+   - **Round 1:** the 3 models run **in parallel** (3 sub-sessions, `agent: explore`, read-only tools) on the same diff.
+   - **Rounds 2 / 3:** each reviewer receives what **all** reviewers said in the previous round (with its own slot marked `→ VOS`), and is asked to defend, accept, or adjust. Returns its updated review.
+   - **Early stop:** if no reviewer's text changed significantly (Jaccard ratio < 5% across all three), the debate converges and stops early — it won't waste a full 3 rounds if everyone already agrees.
+4. **Consolidation:** a 4th free model reads the 3 final reviews and produces a single consolidated review — deduplicated, ordered by severity (Bloquante > Importante > Menor > Pregunta), with conflicts noted as `_(conflicto: X vs Y)_`. It never invents issues that didn't appear in the debate.
+5. **Output:** the consolidated review is shown in the TUI. With `--post` it's also uploaded as a comment on the PR.
+
+Each reviewer has a 5-minute timeout per round; if a model hangs or rate-limits, that sub-session is aborted and the reviewer reports a failure (the other two continue). The header of the output shows which models were used, how many rounds ran, and total elapsed time.
+
+### Example
+
+```
+/code-review-free https://github.com/owner/repo/pull/42 --post
+```
+
+Picks 3 free models, fetches the diff, runs up to 3 rounds of debate, consolidates, posts the review as a PR comment, and shows it in the TUI.
+
 ## Install
 
 ### 1. Copy the plugin
@@ -71,6 +112,7 @@ Add the NVIDIA provider to `~/.config/opencode/opencode.json`:
       },
       "models": {
         "moonshotai/kimi-k2.6":                          { "name": "Kimi K2.6 (NIM)",                    "tool_call": true },
+        "z-ai/glm-5.2":                                  { "name": "GLM 5.2 (NIM)",                      "tool_call": true },
         "deepseek-ai/deepseek-v4-flash":                 { "name": "DeepSeek V4 Flash (NIM)",            "tool_call": true },
         "deepseek-ai/deepseek-v4-pro":                   { "name": "DeepSeek V4 Pro (NIM)",              "tool_call": true },
         "qwen/qwen3-coder-480b-a35b-instruct":           { "name": "Qwen3 Coder 480B (NIM)",             "tool_call": true },
@@ -110,6 +152,10 @@ And register the command so autocomplete works:
     "prefer-free": {
       "description": "Toggle free model swapping / view swap log",
       "template": "[on|off|failover|log|clear|refresh|catalog|help]"
+    },
+    "code-review-free": {
+      "description": "Code-review a PR with 3 free models in a max-3-rounds swarm (no paid)",
+      "template": "<url-or-number> [--post] [--bash]"
     }
   }
 }
@@ -133,6 +179,7 @@ Restart OpenCode. The plugin is **on by default**.
 | `/prefer-free clear`         | Clear the log |
 | `/prefer-free refresh`       | Refresh the free-model list right now (NIM + OpenRouter + Zen) |
 | `/prefer-free catalog`       | Show the cached free-model list and how old it is |
+| `/code-review-free`          | Review a PR with a 3-model free swarm (max 3 rounds of debate) — see [above](#code-review-free--swarm-code-review) |
 
 ## Files it creates
 
