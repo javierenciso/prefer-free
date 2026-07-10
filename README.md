@@ -24,7 +24,7 @@ Every time a session starts (or a sub-task is spawned), the plugin:
 | `kimi-k2.6`              | `nvidia/moonshotai/kimi-k2.6` *(same model)*          | qwen3-coder-480b, deepseek-v4-flash, zen, llama-3.3-70b |
 | `deepseek-v4-pro`        | `nvidia/deepseek-ai/deepseek-v4-pro` *(same model)*   | nemotron-ultra-253b, nemotron-3-super-120b, zen, llama-3.3-70b |
 
-If NVIDIA NIM can't be used (no API key, model removed, rate-limited, or you're offline), the plugin uses the built-in OpenCode Zen free models instead (`mimo-v2.5-free`, `nemotron-3-super-free`, `deepseek-v4-flash-free`).
+If NVIDIA NIM can't be used (no API key, model removed, rate-limited, or you're offline), the plugin uses OpenCode Zen free models that are **actually registered in your local OpenCode runtime** (e.g. `mimo-v2.5-free`, `deepseek-v4-flash-free`). Note: `models.dev` may list more Zen free IDs than OpenCode exposes — the plugin intersects both lists before swapping or running `/code-review-free`.
 
 ## Auto-retry when a free model gets stuck
 
@@ -61,7 +61,7 @@ A built-in command that reviews a GitHub PR using **3 free models** debating wit
 ### How it works
 
 1. **Fetches the diff** via `gh pr diff` (+ metadata via `gh pr view --json`). Diffs over 60k chars are truncated.
-2. **Picks 3 free models** — prefers GLM-5.2, Kimi K2.6, DeepSeek V4-Pro on NVIDIA NIM; falls back to Qwen3 Coder 480B, Qwen3.5 397B, Zen free models, etc. Reuses the same `cachedAllFree` set that `/prefer-free` maintains.
+2. **Picks 3 free models** — prefers GLM-5.2, Kimi K2.6, DeepSeek V4-Pro on NVIDIA NIM; falls back to Qwen3 Coder 480B, Qwen3.5 397B, Zen free models, etc. Reuses the same `cachedAllFree` set that `/prefer-free` maintains, **intersected with models registered in the OpenCode runtime** (so a models.dev-only ID like a missing Zen free never gets prompted).
 3. **Debate — max 3 rounds**:
    - **Round 1:** the 3 models run **in parallel** (3 sub-sessions, `agent: explore`, read-only tools) on the same diff.
    - **Rounds 2 / 3:** each reviewer receives what **all** reviewers said in the previous round (with its own slot marked `→ VOS`), and is asked to defend, accept, or adjust. Returns its updated review.
@@ -172,7 +172,7 @@ Restart OpenCode. The plugin is **on by default**.
 | `/prefer-free`               | Show the current status |
 | `/prefer-free help`          | Show full help |
 | `/prefer-free on`            | Turn free swapping on (default) |
-| `/prefer-free off`           | Turn it off — use the original paid models |
+| `/prefer-free off`           | Turn swapping off — use paid models. Does **not** disable `/code-review-free` |
 | `/prefer-free failover on`   | Turn auto-retry on stuck models on (default) |
 | `/prefer-free failover off`  | Turn auto-retry off — a stuck model stays stuck |
 | `/prefer-free log`           | Show the last 30 swaps, retries, and catalog changes |
