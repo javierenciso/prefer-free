@@ -230,8 +230,10 @@ const OPENROUTER_EQUIVALENTS: Record<string, string[]> = {
   ],
 }
 
-// ── Known free models (always available, no provider config needed) ──
-// OpenCode Zen free models (built-in, always available)
+// ── Zen free preferences (offline / catalog fallback) ──────────
+// models.dev often lists more Zen free IDs than OpenCode registers at runtime.
+// Treat these as ordered preferences — always intersect with the runtime
+// registry before prompting (see refreshRuntimeModels / computeAllFree).
 const ZEN_FREE = new Set([
   "opencode/deepseek-v4-flash-free",
   "opencode/mimo-v2.5-free",
@@ -294,29 +296,71 @@ function rt(id: string): SessionRt {
 // Computed once per session in the config hook; read by the event/watchdog hooks
 // which don't receive config. Persists for the plugin's lifetime in-process.
 let cachedAllFree = new Set<string>()
+// Models actually registered by OpenCode (`providerID/modelID`). Catalog sources
+// (esp. models.dev Zen) can list IDs the runtime does not expose — intersect
+// before swap / /code-review-free so we never prompt a ghost model.
+let cachedRuntimeModels = new Set<string>()
 let watchdogStarted = false
 
+async function refreshRuntimeModels(client: any): Promise<Set<string>> {
+  const out = new Set<string>()
+  try {
+    const listFn = client?.v2?.model?.list ?? client?.model?.list
+    if (!listFn) return out
+    const res: any = await listFn.call(client.v2?.model ?? client.model, {})
+    const models: any[] = res?.data?.data ?? res?.data ?? []
+    for (const m of models) {
+      const pid = m.providerID ?? m.provider
+      const id = m.id ?? m.modelID
+      if (pid && id) out.add(`${pid}/${id}`)
+    }
+  } catch {}
+  return out
+}
+
 // Build the union of currently-free model ids from a catalog + provider config.
-function computeAllFree(catalog: Catalog, providerConfig: any): { allFree: Set<string>; nvidiaCount: number } {
+// When `runtime` is non-empty, Zen/NIM (and config-declared free) IDs must also
+// appear there. OpenRouter catalog entries stay unprefixed (`org/model:free`)
+// for compatibility with existing FREE_EQUIVALENTS / OPENROUTER_EQUIVALENTS.
+function computeAllFree(
+  catalog: Catalog,
+  providerConfig: any,
+  runtime?: Set<string>,
+): { allFree: Set<string>; nvidiaCount: number } {
+  const zenFromCatalog = catalog.zen.length ? catalog.zen : [...ZEN_FREE]
+  const zen = runtime?.size
+    ? zenFromCatalog.filter((m) => runtime.has(m))
+    : zenFromCatalog
   const allFree = new Set<string>([
     ...catalog.openrouter,
-    ...(catalog.zen.length ? catalog.zen : ZEN_FREE),
+    ...zen,
   ])
   let nvidiaCount = 0
   if (process.env.NVIDIA_API_KEY && providerConfig?.nvidia) {
     for (const id of catalog.nim) {
-      allFree.add(`nvidia/${id}`)
-      nvidiaCount++
+      const ref = `nvidia/${id}`
+      if (!runtime?.size || runtime.has(ref)) {
+        allFree.add(ref)
+        nvidiaCount++
+      }
     }
   }
-  for (const [, pConfig] of Object.entries(providerConfig ?? {})) {
+  for (const [provider, pConfig] of Object.entries(providerConfig ?? {})) {
     for (const [modelId, model] of Object.entries((pConfig as any).models ?? {})) {
       const name = (model as any).name ?? modelId
       if (
         /(^|[-_:/\s])free($|[-_:\s])/i.test(name) ||
         /(^|[-_:/\s])free($|[-_:\s])/i.test(modelId)
       ) {
-        allFree.add(modelId)
+        const ref = modelId.includes("/") ? modelId : `${provider}/${modelId}`
+        if (!runtime?.size || runtime.has(ref)) allFree.add(ref)
+      }
+    }
+  }
+  if (runtime?.size) {
+    for (const m of runtime) {
+      if (m.startsWith("openrouter/") && m.endsWith(":free")) {
+        allFree.add(m.slice("openrouter/".length))
       }
     }
   }
@@ -435,12 +479,14 @@ async function fetchPr(
   pr: number,
   repo: string | null,
 ): Promise<{ title: string; body: string; base: string; head: string; diff: string; repo: string | null }> {
-  const repoFlag = repo ? `--repo ${repo}` : ""
-  const metaJson = await $`gh pr view ${pr} ${repoFlag} --json title,body,baseRefName,headRefName,headRepository`
-    .quiet().text()
+  // BunShell interpolates arrays as separate argv entries; a single
+  // `--repo owner/repo` string would be passed as one arg and break gh.
+  const repoArgs: string[] = repo ? ["--repo", repo] : []
+  const metaJson = await $`gh pr view ${pr} ${repoArgs} --json title,body,baseRefName,headRefName,headRepository`
+    .nothrow().quiet().text()
   let meta: any = {}
   try { meta = JSON.parse(metaJson || "{}") } catch {}
-  const diff = await $`gh pr diff ${pr} ${repoFlag}`.quiet().text().catch(() => "") as string
+  const diff = await $`gh pr diff ${pr} ${repoArgs}`.nothrow().quiet().text().catch(() => "") as string
   const head = meta?.headRepository?.name
     ? `${meta.headRepository.name}:${meta.headRefName}`
     : (meta?.headRefName ?? "")
@@ -851,20 +897,36 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     }
 
     // Armar lista de 3 modelos free. Prefiere PREFERRED; completa con OTHER que
-    // estén disponibles. cachedAllFree viene del último config hook corrido.
+    // estén en catálogo Y registrados en runtime (models.dev can list Zen IDs
+    // OpenCode does not expose — see issue #2).
+    const runtime = cachedRuntimeModels.size
+      ? cachedRuntimeModels
+      : await refreshRuntimeModels(cli)
+    if (runtime.size) cachedRuntimeModels = runtime
+
+    const isUsable = (m: string, set: Set<string>) =>
+      set.has(m) && (!runtime.size || runtime.has(m))
+
     const pick = (set: Set<string>, count: number): string[] => {
       const out: string[] = []
-      for (const m of PREFERRED_REVIEW_MODELS) if (set.has(m) && out.length < count) out.push(m)
-      for (const m of OTHER_REVIEW_FREE) if (set.has(m) && out.length < count) out.push(m)
+      for (const m of PREFERRED_REVIEW_MODELS) if (isUsable(m, set) && out.length < count) out.push(m)
+      for (const m of OTHER_REVIEW_FREE) if (isUsable(m, set) && out.length < count) out.push(m)
       return out
     }
     const allFree = cachedAllFree.size
       ? cachedAllFree
-      : new Set<string>([...PREFERRED_REVIEW_MODELS, ...OTHER_REVIEW_FREE])
+      : computeAllFree(
+          readCatalog() ?? { fetchedAt: 0, nim: [], openrouter: [], zen: [] },
+          {},
+          runtime,
+        ).allFree
     let models = pick(allFree, 3)
     if (models.length < 3) {
-      // última opción: Zen que están disponibles siempre.
-      for (const m of [...ZEN_FREE]) if (!models.includes(m) && models.length < 3) models.push(m)
+      for (const m of [...ZEN_FREE]) {
+        if (!models.includes(m) && (!runtime.size || runtime.has(m)) && models.length < 3) {
+          models.push(m)
+        }
+      }
     }
     if (models.length === 0) {
       output.parts = [{
@@ -949,7 +1011,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     }
 
     // Consolidador: el primer free disponible (mismo orden que el review).
-    const merger = models[0] || PREFERRED_REVIEW_MODELS[0] || "opencode/glm-5-free"
+    const merger = models[0]
     const consolidated = await mergeReviews(
       cli,
       input.sessionID,
@@ -980,7 +1042,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     // Postear a GitHub si se pidió.
     if (wantsPost) {
       try {
-        const repoFlag = parsed.repo ? `--repo ${parsed.repo}` : ""
+        const repoArgs: string[] = parsed.repo ? ["--repo", parsed.repo] : []
         // gh pr comment espera el body por stdin o --body. Usamos un temp file
         // para no pelear con shell quoting.
         const tmpPath = join(
@@ -988,7 +1050,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           ".config/opencode/.prefer-free-review.md",
         )
         writeFileSync(tmpPath, finalText)
-        await shell`gh pr comment ${parsed.pr} ${repoFlag} --body-file ${tmpPath}`.quiet()
+        await shell`gh pr comment ${parsed.pr} ${repoArgs} --body-file ${tmpPath}`.quiet()
         try { await shell`rm -f ${tmpPath}`.quiet() } catch {}
         output.parts = [{
           type: "text",
@@ -1084,7 +1146,14 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
 
     "command.execute.before": async (input, output) => {
       if (input.command === "code-review-free") {
-        await runCodeReviewFree(input, output, client, $)
+        try {
+          await runCodeReviewFree(input, output, client, $)
+        } catch (e: any) {
+          output.parts = [{
+            type: "text",
+            text: `❌ code-review-free falló: ${e?.message ?? e}`,
+          } as any]
+        }
         return
       }
       if (input.command !== "prefer-free") return
@@ -1210,7 +1279,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
             "  /prefer-free            → estado actual",
             "  /prefer-free help       → esta ayuda",
             "  /prefer-free on         → activar swap a modelos free",
-            "  /prefer-free off        → desactivar (usa opencode-go)",
+            "  /prefer-free off        → desactivar swap (usa opencode-go); /code-review-free sigue activo",
             "  /prefer-free failover on/off → reintento automático ante rate-limit/cuelgue",
             "  /prefer-free log        → últimos 30 swaps/failovers + diffs de catalog",
             "  /prefer-free clear      → limpiar log",
@@ -1222,6 +1291,8 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
             "  NVIDIA NIM (free tier) si está disponible. Fallback: Qwen3 Coder 480B,",
             "  zen free models, Llama 3.3 70B.",
             "  Catalog (NIM + OpenRouter :free + Zen) se cachea 6h, refresh en bg.",
+            "  Antes de swappear o de /code-review-free, se intersecta con los modelos",
+            "  que OpenCode registra en runtime (models.dev puede listar más).",
             "",
             "Failover (mid-session):",
             "  Si el free se tranca por rate-limit/429, error o cuelgue silencioso",
@@ -1242,11 +1313,8 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     },
 
     config: async (config) => {
-      if (!readState().enabled) return
-
-      // Load catalog. Stale-while-revalidate: use cached lists for THIS session,
-      // fire background refresh if older than TTL. First-ever run blocks on a
-      // single fetch so we have something to work with.
+      // Always refresh catalog + runtime free set — even when PreferFree swap is
+      // OFF — so /code-review-free still has a validated model list (issue #2).
       let catalog = readCatalog()
       if (!catalog) {
         catalog = await refreshCatalog()
@@ -1254,12 +1322,17 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         refreshCatalog().catch(() => {})
       }
 
-      // Union of free model ids from all sources (Zen falls back to the hardcoded
-      // set if the catalog fetch failed, e.g. offline). NIM is only treated as
-      // free when the provider is declared AND NVIDIA_API_KEY is set, else 401.
-      const { allFree, nvidiaCount } = computeAllFree(catalog, config.provider ?? {})
+      const runtime = await refreshRuntimeModels(client)
+      if (runtime.size) cachedRuntimeModels = runtime
 
-      // Cache for the event/watchdog hooks (no config there) and arm the watchdog.
+      // Union of free model ids, intersected with OpenCode's runtime registry
+      // when available. NIM only when provider is declared AND NVIDIA_API_KEY set.
+      const { allFree, nvidiaCount } = computeAllFree(
+        catalog,
+        config.provider ?? {},
+        runtime,
+      )
+
       cachedAllFree = allFree
       startWatchdog()
 
@@ -1267,8 +1340,10 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
       client.app.log({
         service: "prefer-free",
         level: "info",
-        message: `free=${allFree.size} (NIM ${nvidiaCount} · OR ${catalog.openrouter.length} · Zen ${catalog.zen.length || ZEN_FREE.size}) cat=${ageH}h`,
+        message: `free=${allFree.size} (runtime ${runtime.size} · NIM ${nvidiaCount} · OR ${catalog.openrouter.length} · Zen ${catalog.zen.length || ZEN_FREE.size}) cat=${ageH}h`,
       })
+
+      if (!readState().enabled) return
 
       // Swap a single model reference — rotates among free candidates
       const state = readState()
