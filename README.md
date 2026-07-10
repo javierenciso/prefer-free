@@ -203,6 +203,11 @@ When the list updates, the plugin compares it to the old one and logs anything a
 
 Run `/prefer-free refresh` to update the list right away, and `/prefer-free catalog` to see what's currently free.
 
+
+## OpenCode command-hook quirk
+
+OpenCode's `command.execute.before` hook does **not** short-circuit the LLM turn, and reassigning `output.parts` to a new array is ignored by the caller (it keeps its own array reference). This plugin mutates `output.parts` in place via `splice` and prepends a one-line ACK so `/prefer-free` / `/code-review-free` show the plugin output instead of being re-interpreted as a free-form prompt. See issue #1.
+
 ## License
 
 MIT
