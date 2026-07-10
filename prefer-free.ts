@@ -457,6 +457,20 @@ type ReviewResult = {
 // con type+text funciona).
 const tp = (text: string): any => ({ type: "text", text })
 
+
+// OpenCode keeps its own `parts` array reference after command.execute.before
+// (issue #1). Reassigning output.parts to a new array is a no-op for the caller —
+// mutate in place with splice, and prepend a short ACK so the unavoidable LLM
+// turn just confirms instead of re-interpreting the command template.
+const ACK_PART: any = {
+  type: "text",
+  text: "[prefer-free plugin] El siguiente bloque es output del plugin y el usuario ya lo tiene en pantalla. Tu única respuesta debe ser: ✅ — un solo carácter, sin repetir el bloque, sin agregar nada, sin ejecutar herramientas.",
+}
+function setCommandParts(output: { parts: any[] }, ...parts: any[]) {
+  output.parts.splice(0, output.parts.length, ACK_PART, ...parts)
+}
+
+
 function splitModel(ref: string): { providerID: string; modelID: string } {
   const slash = ref.indexOf("/")
   return { providerID: ref.slice(0, slash), modelID: ref.slice(slash + 1) }
@@ -901,7 +915,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     const cleanArg = rawArg.replace(/\s--(?:post|bash)\b/g, "").trim()
 
     if (!cleanArg) {
-      output.parts = [tp([
+      setCommandParts(output, tp([
         "📖 /code-review-free — code review del PR con 3 modelos free en paralelo",
         "",
         "USO:",
@@ -919,13 +933,13 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         "  Al final un 4° modelo consolida todo en un único review.",
         "",
         "NUNCA usa paid. Si un free falla salta al siguiente de la lista.",
-      ].join("\n"))]
+      ].join("\n")))
       return
     }
 
     const parsed = parsePrArg(cleanArg)
     if (parsed.error) {
-      output.parts = [tp("❌ " + parsed.error)]
+      setCommandParts(output, tp("❌ " + parsed.error))
       return
     }
 
@@ -934,12 +948,12 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
     // comes back. Per the swarm spec from brave search (issue #9306), we
     // cannot prevent the LLM from receiving this — but a neutral preamble
     // encourages the model to just acknowledge and stop.
-    output.parts = [tp(
+    setCommandParts(output, tp(
       `🔄 **code-review-free** — PR #${parsed.pr}${parsed.repo ? ` (${parsed.repo})` : ""}\n` +
       `Swarm iniciado en background. Vas a ver toasts de progreso y cuando` +
       ` termine el review consolidado aparece acá mismo.\n` +
       `_(este mensaje no necesita respuesta — podés seguir trabajando)_`,
-    )]
+    ))
 
     // Detached: does NOT block the hook return. Errors are logged + toasted,
     // never thrown into the hook's promise chain.
@@ -989,75 +1003,8 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           for (const m of OTHER_REVIEW_FREE) if (isUsable(m, set) && out.length < count) out.push(m)
           return out
         }
-        const allFree = cachedAllFree.size
-          ? cachedAllFree
-          : computeAllFree(
-              readCatalog() ?? { fetchedAt: 0, nim: [], openrouter: [], zen: [] },
-              {},
-              runtime,
-            ).allFree
-        let models = pick(allFree, 3)
-        if (models.length < 3) {
-          for (const m of [...ZEN_FREE]) {
-            if (!models.includes(m) && (!runtime.size || runtime.has(m)) && models.length < 3) {
-              models.push(m)
-            }
-          }
-        }
-        if (models.length === 0) {
-          await cli.tui.showToast({ body: {
-            title: "code-review-free",
-            message: "❌ No hay modelos free disponibles.",
-            variant: "error",
-            duration: 8000,
-          } }).catch(() => {})
-          await publishToSession(cli, sessionID, tp("❌ No encontré ningún modelo free para hacer code review."))
-          return
-        }
-
-        const reviewPrompt = buildReviewPrompt(pr, diff, truncatedNote)
-
-        await cli.tui.showToast({ body: {
-          title: "code-review-free",
-          message: `Swarm ${models.length} modelos · max ${REVIEW_MAX_ROUNDS} rondas: ${models.map(shortName).join(", ")}…`,
-          variant: "info",
-          duration: 6000,
-        } }).catch(() => {})
-
-        const pr = await fetchPr(shell, parsed.pr, parsed.repo)
-        if (!pr.diff) {
-          await cli.tui.showToast({ body: {
-            title: "code-review-free",
-            message: `❌ No pude sacar el diff del PR #${parsed.pr}. ¿gh auth y PR existe?`,
-            variant: "error",
-            duration: 8000,
-          } }).catch(() => {})
-          await publishToSession(cli, sessionID, tp(`❌ No pude sacar el diff del PR #${parsed.pr}. ¿gh está autenticado y el PR existe?`))
-          return
-        }
-
-        const MAX_DIFF_CHARS = 60_000
-        let diff = pr.diff
-        let truncatedNote = ""
-        if (diff.length > MAX_DIFF_CHARS) {
-          diff = diff.slice(0, MAX_DIFF_CHARS)
-          truncatedNote = `\n\n>[diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales)]\n\n`
-        }
-
-        // ── Etapa 2: pick 3 models ──
-        // code-review-free es independiente de prefer-free ON/OFF: arma su
-        // propia lista de modelos free sin depender de cachedAllFree (que
-        // solo se llena si prefer-free está ON). Si cachedAllFree tiene
-        // datos los aprovecha (mejor: incluye lo que el catálogo refrescó),
-        // si no, usa la lista hardcoded de PREFERRED + OTHER + ZEN.
-        const pick = (set: Set<string>, count: number): string[] => {
-          const out: string[] = []
-          for (const m of PREFERRED_REVIEW_MODELS) if (set.has(m) && out.length < count) out.push(m)
-          for (const m of OTHER_REVIEW_FREE) if (set.has(m) && out.length < count) out.push(m)
-          return out
-        }
-        // Union: lo que cachedAllFree tenga (si prefer-free está ON) +
-        // siempre los hardcoded. Así funciona con o sin prefer-free.
+        // Always include hardcoded prefs (works even if prefer-free swap is OFF /
+        // cachedAllFree empty). isUsable() still requires runtime registration.
         const allFree = new Set<string>([
           ...PREFERRED_REVIEW_MODELS,
           ...OTHER_REVIEW_FREE,
@@ -1066,7 +1013,11 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         ])
         let models = pick(allFree, 3)
         if (models.length < 3) {
-          for (const m of [...ZEN_FREE]) if (!models.includes(m) && models.length < 3) models.push(m)
+          for (const m of [...ZEN_FREE]) {
+            if (!models.includes(m) && (!runtime.size || runtime.has(m)) && models.length < 3) {
+              models.push(m)
+            }
+          }
         }
         if (models.length === 0) {
           await cli.tui.showToast({ body: {
@@ -1293,10 +1244,10 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         try {
           await runCodeReviewFree(input, output, client, $)
         } catch (e: any) {
-          output.parts = [{
+          setCommandParts(output, {
             type: "text",
             text: `❌ code-review-free falló: ${e?.message ?? e}`,
-          } as any]
+          } as any)
         }
         return
       }
@@ -1307,71 +1258,71 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
 
       if (arg === "on") {
         writeState({ ...readState(), enabled: true })
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: "✅ PreferFree ON — se usarán modelos free cuando sea posible",
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "off") {
         writeState({ ...readState(), enabled: false })
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: "❌ PreferFree OFF — se usarán los modelos originales (opencode-go)",
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "failover on") {
         writeState({ ...readState(), failover: true })
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: "🔁 Failover ON — si un modelo free se tranca (rate-limit/cuelgue) reintenta la task con el siguiente free de la cadena",
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "failover off") {
         writeState({ ...readState(), failover: false })
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: "⏹️  Failover OFF — no se reintenta automáticamente; si un free se tranca queda como está",
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "failover") {
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: `Failover está ${state.failover === false ? "⏹️ OFF" : "🔁 ON"}\n  /prefer-free failover on|off`,
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "log") {
         const log = readLog()
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: log
             ? log.split("\n").filter(Boolean).slice(-30).join("\n")
             : "(sin swaps registrados aún)",
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "clear") {
         try { writeFileSync(LOG_PATH, "") } catch {}
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: "🧹 Log limpiado",
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "refresh") {
         const cat = await refreshCatalog()
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: [
             `🔄 Catalog refresheado ${new Date(cat.fetchedAt).toISOString()}`,
@@ -1381,17 +1332,17 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
             ``,
             `Diff vs anterior queda en /prefer-free log`,
           ].join("\n"),
-        } as any]
+        } as any)
         return
       }
 
       if (arg === "catalog") {
         const cat = readCatalog()
         if (!cat) {
-          output.parts = [{
+          setCommandParts(output, {
             type: "text",
             text: "(sin catalog cacheado — corré /prefer-free refresh)",
-          } as any]
+          } as any)
           return
         }
         const ageH = Math.round(((Date.now() - cat.fetchedAt) / 36e5) * 10) / 10
@@ -1409,12 +1360,12 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           `Zen (${cat.zen.length}):`,
           ...cat.zen.map((m) => `  ${m}`),
         ].filter(Boolean)
-        output.parts = [{ type: "text", text: lines.join("\n") } as any]
+        setCommandParts(output, { type: "text", text: lines.join("\n") } as any)
         return
       }
 
       if (arg === "help" || arg === "") {
-        output.parts = [{
+        setCommandParts(output, {
           type: "text",
           text: [
             `PreferFree está ${state.enabled ? "✅ ON" : "❌ OFF"} · Failover ${state.failover === false ? "⏹️ OFF" : "🔁 ON"}`,
@@ -1446,14 +1397,14 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
             "",
             "NVIDIA NIM: requiere export NVIDIA_API_KEY=nvapi-...",
           ].join("\n"),
-        } as any]
+        } as any)
         return
       }
 
-      output.parts = [{
+      setCommandParts(output, {
         type: "text",
         text: `PreferFree está ${state.enabled ? "✅ ON" : "❌ OFF"}\n/prefer-free help  → ayuda completa`,
-      } as any]
+      } as any)
     },
 
     config: async (config) => {
