@@ -1267,7 +1267,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           const msg = err?.data?.message ?? ""
           const isRateLimit =
             code === 429 ||
-            /rate.?limit|quota|too many|overload|capacity/i.test(msg) ||
+            /rate.?limit|quota|too many|overload|capacity|resourc?e.?exhausted|request limit|exhausted/i.test(msg) ||
             (err?.name === "APIError" && err?.data?.isRetryable)
           if (isRateLimit) {
             await failover(sid, code === 429 ? "rate-limit (429)" : "error del modelo")
