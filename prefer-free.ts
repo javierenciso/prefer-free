@@ -478,6 +478,7 @@ const OTHER_REVIEW_FREE: string[] = [
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000 // cada modelo tiene 5 min para terminar (por ronda)
 const REVIEW_POLL_MS = 2_500
 const REVIEW_MAX_ROUNDS = 3 // rondas de debate entre los reviewers antes de consolidar
+const REVIEW_FALLBACK_BUDGET = 6 // reemplazos por timeout/error en todo el run antes de rendirse
 
 type ReviewResult = {
   model: string // "nvidia/..."
@@ -515,13 +516,13 @@ function splitModel(ref: string): { providerID: string; modelID: string } {
 // Si NO pudimos leer el runtime (SDK vacío + shell falló), caemos a un set
 // CURADO y seguro (opencode/* de 2 segmentos que suelen estar registrados),
 // nunca al catálogo completo — eso reintroduciría ids fantasma (issue #2).
-function pickReviewModels(
+// Like pickReviewModels but returns the FULL ranked list (uncapped), so the
+// swarm can fall back to the next free model when one times out / errors.
+function rankReviewModels(
   runtime: Set<string>,
   cachedFree: Set<string>,
-  count = 3,
 ): string[] {
   const runtimeKnown = runtime.size > 0
-  // Fallback seguro cuando no hay runtime: solo Zen 2-segmentos curados.
   const safeFallback = new Set<string>([...PREFERRED_REVIEW_MODELS, ...ZEN_FREE])
   const gate = runtimeKnown
     ? (m: string) => runtime.has(m)
@@ -535,7 +536,7 @@ function pickReviewModels(
   const seen = new Set<string>()
   const out: string[] = []
   for (const m of candidates) {
-    if (seen.has(m) || out.length >= count) continue
+    if (seen.has(m)) continue
     seen.add(m)
     if (!gate(m)) continue
     out.push(m)
@@ -1055,14 +1056,26 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           truncatedNote = `\n\n>[diff recortado a ${MAX_DIFF_CHARS} chars (${pr.diff.length} reales)]\n\n`
         }
 
-        // ── Etapa 2: pick 3 models (runtime-validated, con fallback shell) ──
+        // ── Etapa 2: build ranked pool + initial 3 models ──
         let runtime = cachedRuntimeModels.size
           ? cachedRuntimeModels
           : await refreshRuntimeModels(cli, shell)
         if (!runtime.size) runtime = await refreshRuntimeModels(cli, shell)
         if (runtime.size) cachedRuntimeModels = runtime
 
-        let models = pickReviewModels(runtime, cachedAllFree, 3)
+        const pool = rankReviewModels(runtime, cachedAllFree)
+        const used = new Set<string>()
+        let budget = REVIEW_FALLBACK_BUDGET
+        const nextUnused = (): string | null => {
+          for (const m of pool) { if (!used.has(m)) { used.add(m); return m } }
+          return null
+        }
+        const models: string[] = []
+        while (models.length < 3) {
+          const m = nextUnused()
+          if (!m) break
+          models.push(m)
+        }
         if (models.length === 0) {
           const hint = runtime.size
             ? "Ningún modelo free del catálogo está registrado en OpenCode."
@@ -1113,13 +1126,42 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
                 ` Podés defender tu postura, aceptar puntos de otros o ajustar.` +
                 ` Devolvé TU review ACTUALIZADO y completo. No repostees lo que dijeron los otros.\n`
 
-          const roundResults = await Promise.all(
+          let roundResults = await Promise.all(
             models.map((m, idx) => {
               const peerContext = roundIndex === 0 ? undefined : buildPeerContext(roundIndex, lastResults, idx)
               const prompt = reviewPrompt + debateHeader + (peerContext ? "\n" + peerContext : "")
               return runReviewer(cli, sessionID, m, prompt, wantsBash)
             }),
           )
+
+          // Fallback: any reviewer that timed out / errored gets replaced by the
+          // next free candidate from the pool — so one stuck model doesn't sink
+          // the whole review. Bounded by REVIEW_FALLBACK_BUDGET across the run.
+          const failed = roundResults.map((r, i) => (r.ok ? -1 : i)).filter((i) => i >= 0)
+          if (failed.length && budget > 0) {
+            const slots: number[] = []
+            const jobs: Promise<ReviewResult>[] = []
+            for (const i of failed) {
+              if (budget <= 0) break
+              const repl = nextUnused()
+              if (!repl) break
+              budget--
+              slots.push(i)
+              const peerContext = roundIndex === 0 ? undefined : buildPeerContext(roundIndex, roundResults, i)
+              const prompt = reviewPrompt + debateHeader + (peerContext ? "\n" + peerContext : "")
+              jobs.push(runReviewer(cli, sessionID, repl, prompt, wantsBash))
+            }
+            if (jobs.length) {
+              await cli.tui.showToast({ body: {
+                title: "code-review-free",
+                message: `↻ ${jobs.length} reviewer(s) cayeron — probando free alternativo…`,
+                variant: "info",
+                duration: 5000,
+              } }).catch(() => {})
+              const repls = await Promise.all(jobs)
+              slots.forEach((slot, k) => { roundResults[slot] = repls[k] })
+            }
+          }
 
           let changedSignificantly = roundIndex === 0
           if (roundIndex > 0) {
@@ -1133,19 +1175,28 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         }
 
         // ── Etapa 4: consolidación ──
+        const anyOk = lastResults.some((r) => r.ok)
         await cli.tui.showToast({ body: {
           title: "code-review-free",
-          message: `Consolidando review con ${models.length} opiniones…`,
-          variant: "info",
+          message: anyOk
+            ? `Consolidando review con ${lastResults.filter((r) => r.ok).length} opiniones…`
+            : `Todos los reviewers fallaron — no hay nada que consolidar`,
+          variant: anyOk ? "info" : "warning",
           duration: 5000,
         } }).catch(() => {})
 
-        const merger = models[0]
-        const consolidated = await mergeReviews(
-          cli, sessionID, merger,
-          { title: pr.title, pr: parsed.pr, repo: parsed.repo },
-          lastResults,
-        )
+        // Consolidate with a model that actually produced output; if none did,
+        // skip the merge and tell the user to retry (rate-limit / loaded free tier).
+        const merger = lastResults.find((r) => r.ok)?.model ?? lastResults[0]?.model ?? models[0]
+        const consolidated = anyOk
+          ? await mergeReviews(
+              cli, sessionID, merger,
+              { title: pr.title, pr: parsed.pr, repo: parsed.repo },
+              lastResults,
+            )
+          : "\n\n> ⚠️ Ningún reviewer free completó a tiempo (todos timeout/error). " +
+            "No hay review para consolidar. Reintentá más tarde — el free tier suele estar cargado — " +
+            "o usá `--post` para dejar el intento registrado en el PR."
 
         const elapsedS = ((Date.now() - t0) / 1000).toFixed(1)
         const header = [
