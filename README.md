@@ -71,6 +71,8 @@ A built-in command that reviews a GitHub PR using **3 free models** debating wit
 
 Each reviewer has a 5-minute timeout per round; if a model hangs or rate-limits, that sub-session is aborted and the reviewer reports a failure (the other two continue). The header of the output shows which models were used, how many rounds ran, and total elapsed time.
 
+> **⚠️ Don't quit OpenCode while the swarm is running.** The swarm runs as a background job detached from the command hook. Closing the TUI window (process stays alive) is fine — the consolidated review is published back into the session and persists. But fully quitting/killing OpenCode mid-run kills that background job, and the result is never written. To make the review survive any crash or accidental quit, use `--post`: it writes the consolidated review to GitHub as a PR comment, which lives independently of your local session.
+
 ### Example
 
 ```
