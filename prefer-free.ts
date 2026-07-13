@@ -170,29 +170,23 @@ async function refreshCatalog(): Promise<Catalog> {
 const FREE_EQUIVALENTS: Record<string, string[]> = {
   "opencode-go/deepseek-v4-flash": [
     "nvidia/deepseek-ai/deepseek-v4-flash",
-    "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
     "opencode/deepseek-v4-flash-free",
     "opencode/mimo-v2.5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
-    "opencode/nemotron-3-super-free",
-    "opencode/glm-5-free",
+    "opencode/nemotron-3-ultra-free",
   ],
   "opencode-go/qwen3.5-plus": [
     "nvidia/qwen/qwen3.5-122b-a10b",
     "nvidia/qwen/qwen3.5-397b-a17b",
-    "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
     "opencode/deepseek-v4-flash-free",
     "opencode/mimo-v2.5-free",
-    "opencode/glm-5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
   ],
   "opencode-go/kimi-k2.6": [
     "nvidia/moonshotai/kimi-k2.6",
-    "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
     "nvidia/deepseek-ai/deepseek-v4-flash",
     "opencode/mimo-v2.5-free",
     "opencode/deepseek-v4-flash-free",
-    "opencode/glm-5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
   ],
   "opencode-go/deepseek-v4-pro": [
@@ -200,14 +194,11 @@ const FREE_EQUIVALENTS: Record<string, string[]> = {
     "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1",
     "nvidia/nvidia/nemotron-3-super-120b-a12b",
     "nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5",
-    "opencode/nemotron-3-super-free",
-    "opencode/glm-5-free",
+    "opencode/nemotron-3-ultra-free",
     "nvidia/meta/llama-3.3-70b-instruct",
   ],
   "opencode-go/glm-5.2": [
     "nvidia/z-ai/glm-5.2",
-    "opencode/glm-5-free",
-    "nvidia/qwen/qwen3-coder-480b-a35b-instruct",
     "opencode/deepseek-v4-flash-free",
     "opencode/mimo-v2.5-free",
     "nvidia/meta/llama-3.3-70b-instruct",
@@ -362,9 +353,16 @@ function computeAllFree(
   runtime?: Set<string>,
 ): { allFree: Set<string>; nvidiaCount: number } {
   const zenFromCatalog = catalog.zen.length ? catalog.zen : [...ZEN_FREE]
+  // When runtime is known, keep only Zen ids actually registered. When it's NOT
+  // known (SDK returned empty and no shell fallback here — see the config hook,
+  // kept SDK-only to avoid the black-TUI deadlock), do NOT trust the models.dev
+  // catalog blindly: it lists Zen ids OpenCode doesn't register (e.g. the old
+  // `nemotron-3-super-free` / `glm-5-free` ghosts) which would then get swapped
+  // in and throw ProviderModelNotFoundError. Fall back to the curated ZEN_FREE
+  // set, which only contains ids we know OpenCode registers.
   const zen = runtime?.size
     ? zenFromCatalog.filter((m) => runtime.has(m))
-    : zenFromCatalog
+    : zenFromCatalog.filter((m) => ZEN_FREE.has(m))
   const allFree = new Set<string>([
     ...catalog.openrouter,
     ...zen,
@@ -465,6 +463,27 @@ const PREFERRED_REVIEW_MODELS: string[] = [
   "opencode/mimo-v2.5-free",
 ]
 
+// NVIDIA NIM free tier. When NVIDIA_API_KEY is set AND the nvidia provider is
+// configured, these are PREFERRED over the opencode Zen free models for review:
+// the Zen free tier is aggressively rate-limited and tends to stall mid-stream
+// (→ timeouts), while NIM free is a separate, more reliable tier. Ordered for
+// coding strength + family diversity across the 3-model swarm (top 3 span
+// distinct families: deepseek, glm, qwen). Always gated by the runtime registry
+// (pickReviewModels), so unregistered ids are skipped.
+//
+// NOTE: this is a curated preference list, NOT refreshed by `/prefer-free
+// refresh` (that only refreshes which models EXIST / are free / are registered).
+// Endpoints that return HTTP 410 (AI_APICallError: Gone) still show as
+// registered, so dead ones must be dropped here by hand. Dropped 2026-07-13:
+// `nvidia/qwen/qwen3-coder-480b-a35b-instruct` (NIM returned Gone).
+const PREFERRED_REVIEW_MODELS_NIM: string[] = [
+  "nvidia/deepseek-ai/deepseek-v4-pro",
+  "nvidia/z-ai/glm-5.2",
+  "nvidia/qwen/qwen3.5-397b-a17b",
+  "nvidia/deepseek-ai/deepseek-v4-flash",
+  "nvidia/meta/llama-3.3-70b-instruct",
+]
+
 const OTHER_REVIEW_FREE: string[] = [
   "opencode/nemotron-3-ultra-free",
   "opencode/north-mini-code-free",
@@ -477,15 +496,35 @@ const OTHER_REVIEW_FREE: string[] = [
 
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000 // cada modelo tiene 5 min para terminar (por ronda)
 const REVIEW_POLL_MS = 2_500
-const REVIEW_MAX_ROUNDS = 3 // rondas de debate entre los reviewers antes de consolidar
+// Rondas de debate entre reviewers antes de consolidar. Con modelos free (Zen)
+// una sola ronda es lo más confiable: las rondas extra duplican el riesgo de
+// timeout (cada modelo tiene REVIEW_TIMEOUT_MS por ronda) y rara vez convergen
+// distinto. Se puede subir con REVIEW_MAX_ROUNDS=N en el entorno.
+const REVIEW_MAX_ROUNDS = (() => {
+  const n = parseInt(process.env.REVIEW_MAX_ROUNDS || "1", 10)
+  // NaN → 1 (env no numérico); Math.max → floor at 1 (env negativo o 0).
+  return Math.max(1, Number.isFinite(n) ? n : 1)
+})()
 const REVIEW_FALLBACK_BUDGET = 6 // reemplazos por timeout/error en todo el run antes de rendirse
 
 type ReviewResult = {
   model: string // "nvidia/..."
-  ok: boolean
-  text: string // texto final (lo que puso el modelo como conclusión)
+  ok: boolean // true solo si la sesión llegó a idle con output
+  partial?: boolean // true si rescatamos texto útil pero no terminó (timeout/error)
+  text: string // review del modelo (sin sufijos de metadata)
   error?: string
   elapsed: number
+}
+
+function hasUsableReview(r: ReviewResult): boolean {
+  return !!(r.ok || r.partial) && !!r.text.trim()
+}
+
+function formatReviewerStatus(r: ReviewResult): string {
+  const secs = (r.elapsed / 1000).toFixed(1)
+  if (r.ok) return `✓ ${secs}s`
+  if (r.partial) return `⏱ parcial (${r.error ?? "incompleto"}, ${secs}s)`
+  return `✗ ${r.error ?? "falló"} (${secs}s)`
 }
 
 // Helper para construir parts del output sin pelear con el SDK que a partir
@@ -516,11 +555,14 @@ function splitModel(ref: string): { providerID: string; modelID: string } {
 // Si NO pudimos leer el runtime (SDK vacío + shell falló), caemos a un set
 // CURADO y seguro (opencode/* de 2 segmentos que suelen estar registrados),
 // nunca al catálogo completo — eso reintroduciría ids fantasma (issue #2).
-// Like pickReviewModels but returns the FULL ranked list (uncapped), so the
-// swarm can fall back to the next free model when one times out / errors.
+//
+// `preferNim`: cuando hay NVIDIA_API_KEY y al menos un NIM está en runtime,
+// los NIM free van PRIMERO. Sin runtime conocido no se eligen NIM (ghost risk).
+// rankReviewModels devuelve el pool completo (sin cap) para fallback de slots.
 function rankReviewModels(
   runtime: Set<string>,
   cachedFree: Set<string>,
+  preferNim = false,
 ): string[] {
   const runtimeKnown = runtime.size > 0
   const safeFallback = new Set<string>([...PREFERRED_REVIEW_MODELS, ...ZEN_FREE])
@@ -528,6 +570,7 @@ function rankReviewModels(
     ? (m: string) => runtime.has(m)
     : (m: string) => safeFallback.has(m)
   const candidates = [
+    ...(preferNim && runtimeKnown ? PREFERRED_REVIEW_MODELS_NIM : []),
     ...PREFERRED_REVIEW_MODELS,
     ...OTHER_REVIEW_FREE,
     ...(cachedFree.size ? [...cachedFree] : []),
@@ -542,6 +585,15 @@ function rankReviewModels(
     out.push(m)
   }
   return out
+}
+
+function pickReviewModels(
+  runtime: Set<string>,
+  cachedFree: Set<string>,
+  count = 3,
+  preferNim = false,
+): string[] {
+  return rankReviewModels(runtime, cachedFree, preferNim).slice(0, count)
 }
 
 // Parsea "URL o número" y devuelve { repo: "owner/repo" | null, pr: number }
@@ -595,17 +647,34 @@ async function runReviewer(
   peerContext?: string,
 ): Promise<ReviewResult> {
   const startedAt = Date.now()
-  const tools: Record<string, boolean> = {
-    read: true,
-    glob: true,
-    grep: true,
-    task: false,
-    edit: false,
-    write: false,
-    bash: allowBash,
-    webfetch: false,
-    websearch: false,
-  }
+  // Tools OFF by default: the full PR diff is already inlined in the prompt, so
+  // the reviewer doesn't need to explore. Free (Zen) models are rate-limited and
+  // tend to stall mid tool-call loop, blowing past REVIEW_TIMEOUT_MS before they
+  // ever write the review. `--bash` opts back into read-only exploration (+bash)
+  // for the rare case the inline diff isn't enough, accepting the timeout risk.
+  const tools: Record<string, boolean> = allowBash
+    ? {
+        read: true,
+        glob: true,
+        grep: true,
+        task: false,
+        edit: false,
+        write: false,
+        bash: true,
+        webfetch: false,
+        websearch: false,
+      }
+    : {
+        read: false,
+        glob: false,
+        grep: false,
+        task: false,
+        edit: false,
+        write: false,
+        bash: false,
+        webfetch: false,
+        websearch: false,
+      }
   const fullPrompt = peerContext
     ? prompt + "\n\n" + peerContext
     : prompt
@@ -623,7 +692,7 @@ async function runReviewer(
         model: { providerID, modelID },
         agent: "explore",
         tools,
-        parts: [{ type: "text", text: prompt }],
+        parts: [{ type: "text", text: fullPrompt }],
       },
     })
 
@@ -631,18 +700,20 @@ async function runReviewer(
     // el handler global del PreferFree; cheap & robust.
     const deadline = Date.now() + REVIEW_TIMEOUT_MS
     let lastStatus = "busy"
+    let statusErrored = false
     while (Date.now() < deadline) {
       await sleep(REVIEW_POLL_MS)
       const st: any = await client.session.status({ path: { id: sid } })
       const status = st?.data?.type ?? st?.data?.status ?? st?.status
       lastStatus = status ?? lastStatus
       if (lastStatus === "idle") break
-      if (lastStatus === "error") throw new Error("session.status=error")
+      if (lastStatus === "error") { statusErrored = true; break }
     }
     if (lastStatus !== "idle") {
-      // Timeout: abortamos y reportamos.
+      // No llegó a idle (timeout o error): abortamos, pero igual leemos los
+      // mensajes — el modelo puede haber escrito un review parcial antes de
+      // frenarse. Descartarlo (como se hacía antes) tiraba trabajo útil.
       await client.session.abort({ path: { id: sid } }).catch(() => {})
-      return { model: modelRef, ok: false, text: "", error: "timeout", elapsed: Date.now() - startedAt }
     }
 
     const msgsRes: any = await client.session.messages({ path: { id: sid } })
@@ -656,10 +727,32 @@ async function runReviewer(
         break
       }
     }
+    const clean = text.trim()
+    if (lastStatus !== "idle") {
+      // Rescate de parcial: texto útil pero ok:false — no mezclar con éxito
+      // completo; downstream usa hasUsableReview() / partial para consolidar.
+      if (clean) {
+        return {
+          model: modelRef,
+          ok: false,
+          partial: true,
+          text: clean,
+          error: statusErrored ? "error-partial" : "timeout-partial",
+          elapsed: Date.now() - startedAt,
+        }
+      }
+      return {
+        model: modelRef,
+        ok: false,
+        text: "",
+        error: statusErrored ? "error" : "timeout",
+        elapsed: Date.now() - startedAt,
+      }
+    }
     return {
       model: modelRef,
-      ok: !!text.trim(),
-      text: text.trim() || "(sin output del modelo)",
+      ok: !!clean,
+      text: clean || "(sin output del modelo)",
       elapsed: Date.now() - startedAt,
     }
   } catch (e: any) {
@@ -683,8 +776,9 @@ async function mergeReviews(
 ): Promise<string> {
   const summaries = results
     .map((r, i) => {
-      const head = `### Reviewer ${i + 1} — ${shortName(r.model)} ${r.ok ? "" : "(FALLÓ: " + (r.error ?? "?") + ")"}`
-      return `${head}\n\n${r.ok ? r.text : "—"}`
+      const tag = r.ok ? "" : r.partial ? " (PARCIAL: " + (r.error ?? "?") + ")" : " (FALLÓ: " + (r.error ?? "?") + ")"
+      const head = `### Reviewer ${i + 1} — ${shortName(r.model)}${tag}`
+      return `${head}\n\n${hasUsableReview(r) ? r.text : "—"}`
     })
     .join("\n\n---\n\n")
 
@@ -758,9 +852,10 @@ function buildPeerContext(round: number, results: ReviewResult[], selfIdx?: numb
   ]
   results.forEach((r, i) => {
     const tag = i === selfIdx ? " → VOS" : ""
-    lines.push(`### Reviewer ${i + 1} — ${shortName(r.model)}${tag}${r.ok ? "" : " (FALLÓ: " + (r.error ?? "?") + ")"}`)
+    const failTag = r.ok ? "" : r.partial ? " (PARCIAL: " + (r.error ?? "?") + ")" : " (FALLÓ: " + (r.error ?? "?") + ")"
+    lines.push(`### Reviewer ${i + 1} — ${shortName(r.model)}${tag}${failTag}`)
     lines.push("")
-    lines.push(r.ok ? r.text : "—")
+    lines.push(hasUsableReview(r) ? r.text : "—")
     lines.push("")
   })
   lines.push(`---`)
@@ -992,13 +1087,17 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         "",
         "FLAGS:",
         "  --post    → sube el review como comentario en el PR (vía gh)",
-        "  --bash    → habilita bash para cada reviewer (default: read-only)",
+        "  --bash    → habilita tools (read/grep/glob + bash) para explorar el",
+        "              repo. Default: sin tools, el diff va inline en el prompt",
+        "              (más rápido y confiable con modelos free).",
         "",
         `HOW IT WORKS:`,
-        `  ${REVIEW_MAX_ROUNDS} rondas max de debate. Cada ronda, los 3 modelos`,
-        "  corren en paralelo y ven lo que dijeron los otros en la ronda",
-        "  anterior. Si convergen (ningún texto cambia >5%) corta antes.",
-        "  Al final un 4° modelo consolida todo en un único review.",
+        `  Los 3 modelos corren en paralelo sobre el diff del PR y un 4° modelo`,
+        "  consolida todo en un único review.",
+        `  Rondas de debate: ${REVIEW_MAX_ROUNDS} (default 1; subí con REVIEW_MAX_ROUNDS=N).`,
+        "  En >1 ronda cada modelo ve lo que dijeron los otros y ajusta; corta",
+        "  antes si convergen (ningún texto cambia >5%).",
+        "  Si un modelo no termina a tiempo se rescata su review parcial.",
         "",
         "NUNCA usa paid. Si un free falla salta al siguiente de la lista.",
       ].join("\n")))
@@ -1063,7 +1162,11 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         if (!runtime.size) runtime = await refreshRuntimeModels(cli, shell)
         if (runtime.size) cachedRuntimeModels = runtime
 
-        const pool = rankReviewModels(runtime, cachedAllFree)
+        const preferNim =
+          !!process.env.NVIDIA_API_KEY &&
+          runtime.size > 0 &&
+          PREFERRED_REVIEW_MODELS_NIM.some((m) => runtime.has(m))
+        const pool = rankReviewModels(runtime, cachedAllFree, preferNim)
         const used = new Set<string>()
         let budget = REVIEW_FALLBACK_BUDGET
         const nextUnused = (): string | null => {
@@ -1137,7 +1240,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           // Fallback: any reviewer that timed out / errored gets replaced by the
           // next free candidate from the pool — so one stuck model doesn't sink
           // the whole review. Bounded by REVIEW_FALLBACK_BUDGET across the run.
-          const failed = roundResults.map((r, i) => (r.ok ? -1 : i)).filter((i) => i >= 0)
+          const failed = roundResults.map((r, i) => hasUsableReview(r) ? -1 : i).filter((i) => i >= 0)
           if (failed.length && budget > 0) {
             const slots: number[] = []
             const jobs: Promise<ReviewResult>[] = []
@@ -1166,7 +1269,12 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           let changedSignificantly = roundIndex === 0
           if (roundIndex > 0) {
             for (let i = 0; i < roundResults.length; i++) {
-              const delta = editDistanceRatio(lastResults[i]?.text ?? "", roundResults[i]?.text ?? "")
+              // Convergencia solo entre reviews completos; parciales no disparan
+              // otra ronda de debate (suelen ser timeout, no cambio de opinión).
+              const prev = lastResults[i]
+              const curr = roundResults[i]
+              if (!prev?.ok || !curr?.ok) continue
+              const delta = editDistanceRatio(prev.text, curr.text)
               if (delta > 0.05) { changedSignificantly = true; break }
             }
           }
@@ -1175,20 +1283,22 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
         }
 
         // ── Etapa 4: consolidación ──
-        const anyOk = lastResults.some((r) => r.ok)
+        const anyComplete = lastResults.some((r) => r.ok)
+        const anyUsable = lastResults.some(hasUsableReview)
         await cli.tui.showToast({ body: {
           title: "code-review-free",
-          message: anyOk
-            ? `Consolidando review con ${lastResults.filter((r) => r.ok).length} opiniones…`
+          message: anyUsable
+            ? `Consolidando review (${lastResults.filter(hasUsableReview).length} opiniones${anyComplete ? "" : ", todas parciales"})…`
             : `Todos los reviewers fallaron — no hay nada que consolidar`,
-          variant: anyOk ? "info" : "warning",
+          variant: anyUsable ? "info" : "warning",
           duration: 5000,
         } }).catch(() => {})
 
-        // Consolidate with a model that actually produced output; if none did,
-        // skip the merge and tell the user to retry (rate-limit / loaded free tier).
-        const merger = lastResults.find((r) => r.ok)?.model ?? lastResults[0]?.model ?? models[0]
-        const consolidated = anyOk
+        const merger =
+          lastResults.find((r) => r.ok)?.model ??
+          lastResults.find((r) => r.partial)?.model ??
+          models[0]
+        const consolidated = anyUsable
           ? await mergeReviews(
               cli, sessionID, merger,
               { title: pr.title, pr: parsed.pr, repo: parsed.repo },
@@ -1205,9 +1315,7 @@ export const PreferFree: Plugin = async ({ client, $ }) => {
           ``,
           `Modelos usados:`,
           ...lastResults.map((r, i) =>
-            `  ${i + 1}. ${shortName(r.model)} — ${
-              r.ok ? `✓ ${(r.elapsed / 1000).toFixed(1)}s` : `✗ ${r.error ?? "falló"} (${(r.elapsed / 1000).toFixed(1)}s)`
-            }`,
+            `  ${i + 1}. ${shortName(r.model)} — ${formatReviewerStatus(r)}`,
           ),
           ``,
           `_Consolidado con ${shortName(merger)} · ${roundIndex + 1} rondas de debate_`,
